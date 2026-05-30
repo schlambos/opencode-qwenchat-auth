@@ -348,29 +348,47 @@ function coerceArgValue(raw) {
   return raw.replace(/\s+$/, '');
 }
 
-// Parse one tool-call block. Accepts the escaping-free ARG format OR raw JSON.
-function parseToolBlock(blockText, toolNames) {
-  const text = blockText.trim();
-
-  // JSON fallback (simple args the model may still emit as JSON)
-  if (text.startsWith('{') || text.startsWith('[')) {
-    try {
-      const parsed = JSON.parse(text);
-      const arr = Array.isArray(parsed) ? parsed : [parsed];
-      const calls = [];
-      for (const c of arr) {
-        const name = c?.name ?? c?.tool ?? c?.function;
-        if (typeof name !== 'string') return null;
-        if (toolNames.size && !toolNames.has(name)) return null;
-        calls.push({ name, arguments: c.arguments ?? c.args ?? c.parameters ?? {} });
-      }
-      return calls.length ? calls : null;
-    } catch { /* fall through to ARG parser */ }
+// Try to parse a block as JSON tool call(s). Returns calls array or null.
+function tryJsonToolCalls(text, toolNames) {
+  const t = text.trim();
+  if (!(t.startsWith('{') || t.startsWith('['))) return null;
+  let parsed;
+  try { parsed = JSON.parse(t); } catch { return null; }
+  const arr = Array.isArray(parsed) ? parsed : [parsed];
+  const calls = [];
+  for (const c of arr) {
+    const name = c?.name ?? c?.tool ?? c?.function;
+    if (typeof name !== 'string') return null;
+    if (toolNames.size && !toolNames.has(name)) return null;
+    calls.push({ name, arguments: c.arguments ?? c.args ?? c.parameters ?? {} });
   }
+  return calls.length ? calls : null;
+}
 
-  // ARG line format — values are verbatim, no escaping required.
-  const lines = text.split('\n');
+const TOOL_LINE_RE = /^\s*(?:TOOL|tool|name)\s*[:=]\s*(.+?)\s*$/;
+const ARG_LINE_RE = /^\s*ARG\s+([A-Za-z0-9_.-]+)\s*[:=]\s*(.*)$/;
+
+// Parse one block using the escaping-free ARG format, tolerating loose model output:
+// the tool name may be `TOOL: name`, `name:`, or just a bare line equal to a known tool.
+function parseArgBlock(blockText, toolNames) {
+  const lines = blockText.replace(/\r/g, '').split('\n');
+
+  // Locate the tool-name line.
   let name = null;
+  let startIdx = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i].trim();
+    if (!raw) continue;
+    const mTool = raw.match(TOOL_LINE_RE);
+    if (mTool) {
+      const n = mTool[1].trim().replace(/[`"',]/g, '');
+      if (!toolNames.size || toolNames.has(n)) { name = n; startIdx = i; break; }
+    }
+    const bare = raw.replace(/[`"',]/g, '').trim();
+    if (toolNames.has(bare)) { name = bare; startIdx = i; break; }
+  }
+  if (!name) return null;
+
   const args = {};
   let curKey = null;
   let curVal = [];
@@ -378,31 +396,35 @@ function parseToolBlock(blockText, toolNames) {
     if (curKey !== null) args[curKey] = coerceArgValue(curVal.join('\n'));
     curKey = null; curVal = [];
   };
-  for (const line of lines) {
-    const mTool = line.match(/^\s*TOOL\s*:\s*(.+?)\s*$/i);
-    const mArg = line.match(/^\s*ARG\s+([A-Za-z0-9_.-]+)\s*:\s*(.*)$/);
-    if (mTool) { commit(); name = mTool[1].trim(); continue; }
+  for (let i = startIdx + 1; i < lines.length; i++) {
+    const mArg = lines[i].match(ARG_LINE_RE);
     if (mArg) { commit(); curKey = mArg[1]; curVal = mArg[2] !== '' ? [mArg[2]] : []; continue; }
-    if (curKey !== null) curVal.push(line);
+    if (curKey !== null) curVal.push(lines[i]);
   }
   commit();
-
-  if (!name) return null;
-  if (toolNames.size && !toolNames.has(name)) return null;
   return [{ name, arguments: args }];
 }
 
-// Extract a tool call from the model's output (fenced block preferred, else whole text).
+// Extract tool call(s) from the model's output. Scans every fenced block plus the raw
+// text, accepting JSON or the loose ARG format with/without fence and TOOL: prefix.
 function extractToolCalls(text, toolNames) {
   if (!text) return null;
-  const fence = text.match(/```(?:tool_call|json)?\s*([\s\S]*?)```/i);
-  if (fence) return parseToolBlock(fence[1], toolNames);
-  const t = text.trim();
-  if (t.startsWith('{') || t.startsWith('[') || /^TOOL\s*:/i.test(t)) {
-    return parseToolBlock(t, toolNames);
+  const blocks = [];
+  const fenceRe = /```[^\n]*\n([\s\S]*?)```/g;
+  let m;
+  while ((m = fenceRe.exec(text))) blocks.push(m[1]);
+  blocks.push(text); // whole-text fallback (model may omit the fence)
+
+  for (const block of blocks) {
+    const json = tryJsonToolCalls(block, toolNames);
+    if (json) return json;
+    const arg = parseArgBlock(block, toolNames);
+    if (arg) return arg;
   }
   return null;
 }
+
+export { extractToolCalls };
 
 // Read the entire Qwen SSE stream, returning the concatenated 'answer' phase text.
 async function collectAnswerText(firstValue, reader) {

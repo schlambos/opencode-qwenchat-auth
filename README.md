@@ -223,6 +223,11 @@ Verified: `read({"path":"package.json"})` round-trips to a final answer, and a `
 command containing nested quotes (`awk '{printf "%s\n", $0}'`) parses into valid JSON
 arguments — the case that broke the earlier JSON-only protocol.
 
+The parser is intentionally forgiving — it scans every fenced block **and** the raw text,
+and accepts the tool name as `TOOL: bash`, `name: bash`, or just a bare `bash` line (smaller
+models like `qwen3.5-flash` often drop the fence/prefix). A normal prose answer that doesn't
+contain a tool-name line is left untouched.
+
 **Caveats:** tool turns lose token-by-token streaming (buffered to parse); one tool call per
 block in `ARG` mode (multiple still supported via a JSON array); deeply nested object args
 rely on the model writing valid JSON on the value line.
