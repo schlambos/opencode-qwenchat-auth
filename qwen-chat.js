@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
-import { existsSync, copyFileSync, readdirSync, readFileSync, writeFileSync } from 'fs';
+import { existsSync, copyFileSync, readdirSync, readFileSync, writeFileSync, appendFileSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 
@@ -9,6 +9,18 @@ const PROVIDER_ID = 'qwen-chat';
 
 const ACCOUNTS_FILE = join(homedir(), '.config', 'opencode', 'qwen-accounts.json');
 const STATE_FILE = join(homedir(), '.config', 'opencode', 'qwen-accounts-state.json');
+
+// Diagnostic logging — only active when the flag file exists (no tokens are logged).
+const DEBUG_FLAG = join(homedir(), '.config', 'opencode', 'qwen-chat-debug');
+const DEBUG_LOG = join(homedir(), '.config', 'opencode', 'qwen-chat-debug.log');
+let debugEnabled = null;
+function dbg(obj) {
+  try {
+    if (debugEnabled === null) debugEnabled = existsSync(DEBUG_FLAG);
+    if (!debugEnabled) return;
+    appendFileSync(DEBUG_LOG, JSON.stringify({ t: new Date().toISOString(), ...obj }) + '\n');
+  } catch { /* ignore */ }
+}
 
 const MODELS = {
   'qwen3.6-plus':        { name: 'Qwen3.6 Plus',        context: 1_000_000, output: 65536 },
@@ -405,22 +417,32 @@ function parseArgBlock(blockText, toolNames) {
   return [{ name, arguments: args }];
 }
 
-// Extract tool call(s) from the model's output. Scans every fenced block plus the raw
-// text, accepting JSON or the loose ARG format with/without fence and TOOL: prefix.
+// Extract tool call(s) from the model's output. Collects from EVERY fenced block (the
+// model often emits several calls at once); falls back to the raw text if no fence.
 function extractToolCalls(text, toolNames) {
   if (!text) return null;
-  const blocks = [];
+
+  const fenced = [];
   const fenceRe = /```[^\n]*\n([\s\S]*?)```/g;
   let m;
-  while ((m = fenceRe.exec(text))) blocks.push(m[1]);
-  blocks.push(text); // whole-text fallback (model may omit the fence)
+  while ((m = fenceRe.exec(text))) fenced.push(m[1]);
 
-  for (const block of blocks) {
-    const json = tryJsonToolCalls(block, toolNames);
-    if (json) return json;
-    const arg = parseArgBlock(block, toolNames);
-    if (arg) return arg;
+  if (fenced.length) {
+    const calls = [];
+    for (const block of fenced) {
+      const json = tryJsonToolCalls(block, toolNames);
+      if (json) { calls.push(...json); continue; }
+      const arg = parseArgBlock(block, toolNames);
+      if (arg) calls.push(...arg);
+    }
+    if (calls.length) return calls;
   }
+
+  // No fenced calls — try the whole text once (model may omit the fence entirely).
+  const json = tryJsonToolCalls(text, toolNames);
+  if (json) return json;
+  const arg = parseArgBlock(text, toolNames);
+  if (arg) return arg;
   return null;
 }
 
@@ -602,6 +624,13 @@ async function qwenFetch(storedToken, input, init) {
   const tools = Array.isArray(body.tools) && body.tools.length ? body.tools : null;
   const wantTools = tools && body.tool_choice !== 'none';
   const toolNames = new Set((tools ?? []).map(t => t.function?.name ?? t.name).filter(Boolean));
+
+  dbg({
+    phase: 'request', model,
+    hasToolsField: Array.isArray(body.tools), nTools: (body.tools ?? []).length,
+    toolNames: [...toolNames], tool_choice: body.tool_choice ?? null,
+    nMessages: messages.length, lastRole: messages[messages.length - 1]?.role ?? null,
+  });
   const promptText = wantTools ? buildToolPrompt(messages, tools) : flattenConversation(messages);
   const userMessage = toQwenMessage({ role: 'user', content: promptText }, model);
 
@@ -692,6 +721,12 @@ async function qwenFetch(storedToken, input, init) {
     if (wantTools) {
       const answer = await collectAnswerText(first.value, reader);
       const calls = extractToolCalls(answer, toolNames);
+      dbg({
+        phase: 'tool_response', model,
+        emitted: calls ? 'tool_calls' : 'content',
+        parsed: calls?.map(c => ({ name: c.name, argKeys: Object.keys(c.arguments ?? {}) })) ?? null,
+        answerSample: answer.slice(0, 1800),
+      });
       const chunks = calls
         ? toolCallResponseChunks(calls, model)
         : contentResponseChunks(answer, model);
