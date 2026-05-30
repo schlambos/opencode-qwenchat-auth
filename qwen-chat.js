@@ -311,10 +311,21 @@ function buildToolPrompt(messages, tools) {
     p += '# Tool-calling protocol\n\n';
     p += 'You can call tools to complete the task. Available tools:\n\n';
     p += renderToolsForPrompt(tools) + '\n\n';
-    p += 'To call a tool, reply with ONLY a fenced block, nothing before or after:\n\n';
-    p += '```tool_call\n{"name": "<tool_name>", "arguments": { ...args... }}\n```\n\n';
-    p += 'To call multiple tools at once, put a JSON array of such objects inside the block.\n';
-    p += 'After each call you will receive a "Tool result" message. Continue calling tools as needed.\n';
+    p += 'To call a tool, reply with ONLY a fenced block, nothing before or after it:\n\n';
+    p += '```tool_call\n';
+    p += 'TOOL: <tool_name>\n';
+    p += 'ARG <arg_name>: <value>\n';
+    p += 'ARG <arg_name>: <value>\n';
+    p += '```\n\n';
+    p += 'Rules:\n';
+    p += '- Each `ARG` line gives one argument. A value may span multiple lines; it continues until the next `ARG` line or the end of the block.\n';
+    p += '- Write values LITERALLY. Do NOT escape quotes, backslashes, or newlines. Shell commands are written exactly as you would type them.\n';
+    p += '- For numbers, booleans, arrays, or objects, write them as JSON on the value line (e.g. `ARG limit: 100` or `ARG paths: ["a","b"]`).\n\n';
+    p += 'Example — read a file:\n';
+    p += '```tool_call\nTOOL: read\nARG path: src/index.ts\n```\n\n';
+    p += 'Example — run a shell command (note the quotes are written as-is, NOT escaped):\n';
+    p += '```tool_call\nTOOL: bash\nARG command: find . -type f | awk \'{printf "%s\\n", $0}\'\nARG description: list files\n```\n\n';
+    p += 'After each call you receive a "Tool result" message — continue calling tools as needed.\n';
     p += 'When the task is complete, reply normally with your final answer and NO tool_call block.\n\n';
   }
   if (convo.length > 1) p += '--- Conversation so far ---\n\n';
@@ -323,30 +334,74 @@ function buildToolPrompt(messages, tools) {
   return p;
 }
 
-// Parse the model's text output for a tool call. Returns array of {name, arguments} or null.
+// Coerce a raw value string into JSON when it looks structured, else keep as string.
+function coerceArgValue(raw) {
+  const t = raw.trim();
+  if (t === '') return '';
+  if (/^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  if (t === 'true') return true;
+  if (t === 'false') return false;
+  if (t === 'null') return null;
+  if (t.startsWith('{') || t.startsWith('[')) {
+    try { return JSON.parse(t); } catch { /* keep raw */ }
+  }
+  return raw.replace(/\s+$/, '');
+}
+
+// Parse one tool-call block. Accepts the escaping-free ARG format OR raw JSON.
+function parseToolBlock(blockText, toolNames) {
+  const text = blockText.trim();
+
+  // JSON fallback (simple args the model may still emit as JSON)
+  if (text.startsWith('{') || text.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(text);
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      const calls = [];
+      for (const c of arr) {
+        const name = c?.name ?? c?.tool ?? c?.function;
+        if (typeof name !== 'string') return null;
+        if (toolNames.size && !toolNames.has(name)) return null;
+        calls.push({ name, arguments: c.arguments ?? c.args ?? c.parameters ?? {} });
+      }
+      return calls.length ? calls : null;
+    } catch { /* fall through to ARG parser */ }
+  }
+
+  // ARG line format — values are verbatim, no escaping required.
+  const lines = text.split('\n');
+  let name = null;
+  const args = {};
+  let curKey = null;
+  let curVal = [];
+  const commit = () => {
+    if (curKey !== null) args[curKey] = coerceArgValue(curVal.join('\n'));
+    curKey = null; curVal = [];
+  };
+  for (const line of lines) {
+    const mTool = line.match(/^\s*TOOL\s*:\s*(.+?)\s*$/i);
+    const mArg = line.match(/^\s*ARG\s+([A-Za-z0-9_.-]+)\s*:\s*(.*)$/);
+    if (mTool) { commit(); name = mTool[1].trim(); continue; }
+    if (mArg) { commit(); curKey = mArg[1]; curVal = mArg[2] !== '' ? [mArg[2]] : []; continue; }
+    if (curKey !== null) curVal.push(line);
+  }
+  commit();
+
+  if (!name) return null;
+  if (toolNames.size && !toolNames.has(name)) return null;
+  return [{ name, arguments: args }];
+}
+
+// Extract a tool call from the model's output (fenced block preferred, else whole text).
 function extractToolCalls(text, toolNames) {
   if (!text) return null;
-  let jsonStr = null;
   const fence = text.match(/```(?:tool_call|json)?\s*([\s\S]*?)```/i);
-  if (fence) {
-    jsonStr = fence[1].trim();
-  } else {
-    const t = text.trim();
-    if (t.startsWith('{') || t.startsWith('[')) jsonStr = t;
+  if (fence) return parseToolBlock(fence[1], toolNames);
+  const t = text.trim();
+  if (t.startsWith('{') || t.startsWith('[') || /^TOOL\s*:/i.test(t)) {
+    return parseToolBlock(t, toolNames);
   }
-  if (!jsonStr) return null;
-
-  let parsed;
-  try { parsed = JSON.parse(jsonStr); } catch { return null; }
-  const arr = Array.isArray(parsed) ? parsed : [parsed];
-  const calls = [];
-  for (const c of arr) {
-    const name = c?.name ?? c?.tool ?? c?.function;
-    if (typeof name !== 'string') return null;
-    if (toolNames.size && !toolNames.has(name)) return null; // not a real tool → treat as prose
-    calls.push({ name, arguments: c.arguments ?? c.args ?? c.parameters ?? {} });
-  }
-  return calls.length ? calls : null;
+  return null;
 }
 
 // Read the entire Qwen SSE stream, returning the concatenated 'answer' phase text.

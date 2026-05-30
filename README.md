@@ -198,21 +198,34 @@ stay quiet.
 Qwen's web API has **no native function/tool calling**, so agentic Build mode normally
 fails ("Tool X does not exist"). This branch adds a **prompt-based tool-call shim**:
 
-1. When OpenCode sends a `tools` array, the plugin renders the tool schemas into the prompt
-   and instructs Qwen to reply with a fenced `tool_call` JSON block.
-2. The plugin parses that text back into OpenAI `tool_calls` (with `finish_reason:
-   "tool_calls"`), so OpenCode executes the tool normally.
-3. Prior `tool_calls` and `tool` result messages are rendered back into the prompt as
-   `Assistant called tool: …` / `Tool result from …: …`, so the model sees the loop.
-4. Plain chat (no `tools`) still streams normally; tool turns are buffered (needed to detect
-   and parse the call).
+1. When OpenCode sends a `tools` array, the plugin renders the schemas into the prompt and
+   instructs Qwen to reply with a fenced block using an **escaping-free `ARG` format**:
 
-Verified round-trip: the model calls `read({"path":"package.json"})`, the result is fed
-back, and it produces the final answer.
+   ````
+   ```tool_call
+   TOOL: bash
+   ARG command: find . -type f -name "*.js" | awk '{printf "%s\n", $0}'
+   ARG description: list js files
+   ```
+   ````
 
-**Caveats:** relies on the model emitting clean `tool_call` JSON (malformed → treated as a
-normal answer); tool turns lose token-by-token streaming; parallel/nested calls are
-best-effort.
+   Values are written **verbatim** — no JSON string escaping. The plugin then serializes
+   them with `JSON.stringify`, so the `arguments` it emits to OpenCode are **always valid
+   JSON**. (Raw JSON blocks are still accepted as a fallback.)
+2. The parsed call is emitted as OpenAI `tool_calls` (`finish_reason: "tool_calls"`), so
+   OpenCode executes the tool normally.
+3. Prior `tool_calls` / `tool` result messages are rendered back into the prompt
+   (`Assistant called tool: …` / `Tool result from …: …`) so the model sees the loop.
+4. Plain chat (no `tools`) still streams normally; tool turns are buffered (needed to parse
+   the call).
+
+Verified: `read({"path":"package.json"})` round-trips to a final answer, and a `bash`
+command containing nested quotes (`awk '{printf "%s\n", $0}'`) parses into valid JSON
+arguments — the case that broke the earlier JSON-only protocol.
+
+**Caveats:** tool turns lose token-by-token streaming (buffered to parse); one tool call per
+block in `ARG` mode (multiple still supported via a JSON array); deeply nested object args
+rely on the model writing valid JSON on the value line.
 
 ### Limitations of rotation
 
