@@ -263,6 +263,161 @@ function flattenConversation(messages) {
   return prompt;
 }
 
+// ─── Tool-call shim (experimental) ──────────────────────────────────────────────
+// Qwen's web API has no native function calling. We inject a text protocol: the model
+// emits a fenced ```tool_call JSON block, which we parse back into OpenAI tool_calls.
+
+function renderToolsForPrompt(tools) {
+  return tools.map(t => {
+    const f = t.function ?? t;
+    const props = JSON.stringify(f.parameters?.properties ?? {});
+    const required = (f.parameters?.required ?? []).join(', ');
+    return `- ${f.name}: ${(f.description ?? '').split('\n')[0]}\n    parameters: ${props}${required ? `\n    required: [${required}]` : ''}`;
+  }).join('\n');
+}
+
+// Build the flattened prompt, rendering tool_calls / tool results and the protocol.
+function buildToolPrompt(messages, tools) {
+  const sys = [];
+  const convo = [];
+  const idToName = {};
+  for (const m of messages) {
+    if (m.role === 'system') {
+      const t = contentToString(m.content).trim();
+      if (t) sys.push(t);
+    } else if (m.role === 'assistant') {
+      if (Array.isArray(m.tool_calls) && m.tool_calls.length) {
+        for (const tc of m.tool_calls) {
+          const name = tc.function?.name ?? tc.name ?? 'tool';
+          const args = tc.function?.arguments ?? tc.arguments ?? '{}';
+          if (tc.id) idToName[tc.id] = name;
+          convo.push(`Assistant called tool: ${name}(${typeof args === 'string' ? args : JSON.stringify(args)})`);
+        }
+      }
+      const c = contentToString(m.content).trim();
+      if (c) convo.push(`Assistant: ${c}`);
+    } else if (m.role === 'tool') {
+      const name = idToName[m.tool_call_id] ?? 'tool';
+      convo.push(`Tool result from ${name}:\n${contentToString(m.content).trim()}`);
+    } else {
+      const t = contentToString(m.content).trim();
+      if (t) convo.push(`User: ${t}`);
+    }
+  }
+
+  let p = '';
+  if (sys.length) p += sys.join('\n\n') + '\n\n';
+  if (tools?.length) {
+    p += '# Tool-calling protocol\n\n';
+    p += 'You can call tools to complete the task. Available tools:\n\n';
+    p += renderToolsForPrompt(tools) + '\n\n';
+    p += 'To call a tool, reply with ONLY a fenced block, nothing before or after:\n\n';
+    p += '```tool_call\n{"name": "<tool_name>", "arguments": { ...args... }}\n```\n\n';
+    p += 'To call multiple tools at once, put a JSON array of such objects inside the block.\n';
+    p += 'After each call you will receive a "Tool result" message. Continue calling tools as needed.\n';
+    p += 'When the task is complete, reply normally with your final answer and NO tool_call block.\n\n';
+  }
+  if (convo.length > 1) p += '--- Conversation so far ---\n\n';
+  p += convo.join('\n\n');
+  if (tools?.length) p += '\n\nRespond now with either a tool_call block or your final answer.';
+  return p;
+}
+
+// Parse the model's text output for a tool call. Returns array of {name, arguments} or null.
+function extractToolCalls(text, toolNames) {
+  if (!text) return null;
+  let jsonStr = null;
+  const fence = text.match(/```(?:tool_call|json)?\s*([\s\S]*?)```/i);
+  if (fence) {
+    jsonStr = fence[1].trim();
+  } else {
+    const t = text.trim();
+    if (t.startsWith('{') || t.startsWith('[')) jsonStr = t;
+  }
+  if (!jsonStr) return null;
+
+  let parsed;
+  try { parsed = JSON.parse(jsonStr); } catch { return null; }
+  const arr = Array.isArray(parsed) ? parsed : [parsed];
+  const calls = [];
+  for (const c of arr) {
+    const name = c?.name ?? c?.tool ?? c?.function;
+    if (typeof name !== 'string') return null;
+    if (toolNames.size && !toolNames.has(name)) return null; // not a real tool → treat as prose
+    calls.push({ name, arguments: c.arguments ?? c.args ?? c.parameters ?? {} });
+  }
+  return calls.length ? calls : null;
+}
+
+// Read the entire Qwen SSE stream, returning the concatenated 'answer' phase text.
+async function collectAnswerText(firstValue, reader) {
+  const decoder = new TextDecoder();
+  let buffer = firstValue ? decoder.decode(firstValue, { stream: true }) : '';
+  let answer = '';
+  const drain = () => {
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      if (!raw || raw.startsWith('{"response.created"')) continue;
+      try {
+        const d = JSON.parse(raw).choices?.[0]?.delta;
+        if (d?.phase === 'answer' && d.content) answer += d.content;
+      } catch {}
+    }
+  };
+  drain();
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    drain();
+  }
+  return answer;
+}
+
+function sseStreamFrom(chunks) {
+  const enc = new TextEncoder();
+  return new ReadableStream({
+    start(c) { for (const s of chunks) c.enqueue(enc.encode(s)); c.close(); },
+  });
+}
+
+function contentResponseChunks(text, model) {
+  const id = `chatcmpl-${randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
+  return [
+    makeChunk(id, created, model, { role: 'assistant', content: '' }, null),
+    makeChunk(id, created, model, { content: text }, null),
+    makeChunk(id, created, model, {}, 'stop'),
+    'data: [DONE]\n\n',
+  ];
+}
+
+function toolCallResponseChunks(calls, model) {
+  const id = `chatcmpl-${randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
+  const tool_calls = calls.map((c, i) => ({
+    index: i,
+    id: `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
+    type: 'function',
+    function: {
+      name: c.name,
+      arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
+    },
+  }));
+  const mk = (delta, finish) => `data: ${JSON.stringify({
+    id, object: 'chat.completion.chunk', created, model,
+    choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+  })}\n\n`;
+  return [
+    mk({ role: 'assistant', tool_calls }, null),
+    mk({}, 'tool_calls'),
+    'data: [DONE]\n\n',
+  ];
+}
+
 function toQwenMessage(msg, model) {
   return {
     fid: randomUUID(), parentId: null, childrenIds: [],
@@ -367,7 +522,11 @@ async function qwenFetch(storedToken, input, init) {
 
   const model = body.model ?? 'qwen3.6-plus';
   const messages = body.messages ?? [];
-  const userMessage = toQwenMessage({ role: 'user', content: flattenConversation(messages) }, model);
+  const tools = Array.isArray(body.tools) && body.tools.length ? body.tools : null;
+  const wantTools = tools && body.tool_choice !== 'none';
+  const toolNames = new Set((tools ?? []).map(t => t.function?.name ?? t.name).filter(Boolean));
+  const promptText = wantTools ? buildToolPrompt(messages, tools) : flattenConversation(messages);
+  const userMessage = toQwenMessage({ role: 'user', content: promptText }, model);
 
   const now = Date.now();
   const state = loadState();
@@ -445,16 +604,26 @@ async function qwenFetch(storedToken, input, init) {
       lastServedAccountId = id;
     }
 
+    const baseHeaders = {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-cache',
+      'x-accel-buffering': 'no',
+      'x-qwen-account': id,
+    };
+
+    // Tool mode: buffer the full answer, parse for a tool_call, emit OpenAI tool_calls or content.
+    if (wantTools) {
+      const answer = await collectAnswerText(first.value, reader);
+      const calls = extractToolCalls(answer, toolNames);
+      const chunks = calls
+        ? toolCallResponseChunks(calls, model)
+        : contentResponseChunks(answer, model);
+      return new Response(sseStreamFrom(chunks), { status: 200, headers: baseHeaders });
+    }
+
+    // Plain chat: stream straight through.
     const stitched = restitchStream(first.value, reader);
-    return new Response(transformQwenSSE(stitched, model), {
-      status: 200,
-      headers: {
-        'content-type': 'text/event-stream; charset=utf-8',
-        'cache-control': 'no-cache',
-        'x-accel-buffering': 'no',
-        'x-qwen-account': id,
-      },
-    });
+    return new Response(transformQwenSSE(stitched, model), { status: 200, headers: baseHeaders });
   }
 
   notify(`All Qwen accounts failed: ${lastErr?.message ?? 'unknown'}`, 'error');

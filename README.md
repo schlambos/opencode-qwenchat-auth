@@ -193,6 +193,27 @@ The plugin shows OpenCode toast notifications so you always know which account i
 Notifications only fire when the active account *changes*, so normal back-to-back messages
 stay quiet.
 
+### Tool calling (experimental — `tool-shim` branch)
+
+Qwen's web API has **no native function/tool calling**, so agentic Build mode normally
+fails ("Tool X does not exist"). This branch adds a **prompt-based tool-call shim**:
+
+1. When OpenCode sends a `tools` array, the plugin renders the tool schemas into the prompt
+   and instructs Qwen to reply with a fenced `tool_call` JSON block.
+2. The plugin parses that text back into OpenAI `tool_calls` (with `finish_reason:
+   "tool_calls"`), so OpenCode executes the tool normally.
+3. Prior `tool_calls` and `tool` result messages are rendered back into the prompt as
+   `Assistant called tool: …` / `Tool result from …: …`, so the model sees the loop.
+4. Plain chat (no `tools`) still streams normally; tool turns are buffered (needed to detect
+   and parse the call).
+
+Verified round-trip: the model calls `read({"path":"package.json"})`, the result is fed
+back, and it produces the final answer.
+
+**Caveats:** relies on the model emitting clean `tool_call` JSON (malformed → treated as a
+normal answer); tool turns lose token-by-token streaming; parallel/nested calls are
+best-effort.
+
 ### Limitations of rotation
 
 - Detection heuristics are best-effort — Qwen's exact "out of free usage" response isn't
