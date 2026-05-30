@@ -39,18 +39,22 @@ function accountIdOf(token) {
   const c = jwtClaims(token);
   return c?.id ?? `anon:${token.slice(-16)}`;
 }
+function shortId(id) {
+  return String(id).split(':').pop().slice(0, 8);
+}
 
 // ─── Token sources ──────────────────────────────────────────────────────────────
 
-// All Firefox profiles (each profile can be a different Qwen account)
+// All Firefox profiles (each profile can be a different Qwen account).
+// Returns [{ path, label }] where label is a friendly profile name.
 function listFirefoxCookieDbs() {
   const root = join(homedir(), 'Library/Application Support/Firefox/Profiles');
   if (!existsSync(root)) return [];
   let dirs;
   try { dirs = readdirSync(root); } catch { return []; }
   return dirs
-    .map(d => join(root, d, 'cookies.sqlite'))
-    .filter(p => existsSync(p));
+    .map(d => ({ path: join(root, d, 'cookies.sqlite'), label: d.split('.').slice(1).join('.') || d }))
+    .filter(x => existsSync(x.path));
 }
 
 function readTokenFromCookieDb(dbPath, idx) {
@@ -68,22 +72,23 @@ function readTokenFromCookieDb(dbPath, idx) {
 function readFirefoxTokens() {
   const out = [];
   listFirefoxCookieDbs().forEach((db, i) => {
-    const t = readTokenFromCookieDb(db, i);
-    if (t) out.push({ token: t, source: `firefox:${i}` });
+    const t = readTokenFromCookieDb(db.path, i);
+    if (t) out.push({ token: t, label: `Firefox: ${db.label}` });
   });
   return out;
 }
 
-// Optional manual accounts file: { "tokens": ["eyJ...", "eyJ..."] }  (or a bare array)
+// Optional manual accounts file:
+//   { "tokens": ["eyJ...", { "token": "eyJ...", "label": "work" }] }   (or a bare array)
 function readAccountsFileTokens() {
   try {
     if (!existsSync(ACCOUNTS_FILE)) return [];
     const raw = JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf8'));
     const list = Array.isArray(raw) ? raw : Array.isArray(raw.tokens) ? raw.tokens : [];
     return list
-      .map(t => (typeof t === 'string' ? t : t?.token))
-      .filter(Boolean)
-      .map(token => ({ token, source: 'file' }));
+      .map(t => (typeof t === 'string' ? { token: t } : { token: t?.token, label: t?.label }))
+      .filter(x => x.token)
+      .map(x => ({ token: x.token, label: x.label ? `File: ${x.label}` : 'File' }));
   } catch { return []; }
 }
 
@@ -91,7 +96,7 @@ function readAccountsFileTokens() {
 function getTokenFromFirefox() {
   const dbs = listFirefoxCookieDbs();
   for (let i = 0; i < dbs.length; i++) {
-    const t = readTokenFromCookieDb(dbs[i], i);
+    const t = readTokenFromCookieDb(dbs[i].path, i);
     if (t && tokenIsValid(t)) return t;
   }
   return null;
@@ -107,16 +112,18 @@ function collectAccounts(storedToken) {
   const raw = [
     ...readFirefoxTokens(),
     ...readAccountsFileTokens(),
-    ...(storedToken ? [{ token: storedToken, source: 'stored' }] : []),
+    ...(storedToken ? [{ token: storedToken, label: 'Saved login' }] : []),
   ];
 
   const byId = new Map();
-  for (const { token, source } of raw) {
+  for (const { token, label } of raw) {
     if (!tokenIsValid(token)) continue;
     const id = accountIdOf(token);
     const exp = jwtExpiry(token) ?? 0;
     const existing = byId.get(id);
-    if (!existing || exp > existing.exp) byId.set(id, { id, token, exp, source });
+    if (!existing || exp > existing.exp) {
+      byId.set(id, { id, token, exp, label: label ?? `Account ${shortId(id)}` });
+    }
   }
 
   accountsCache = [...byId.values()];
@@ -142,7 +149,6 @@ function nextUtcMidnight(now) {
 function markRateLimited(state, id, kind, now) {
   const entry = state[id] ?? { failures: 0, lastUsed: 0 };
   entry.failures = (entry.failures ?? 0) + 1;
-  // Quota exhaustion → assume daily reset (UTC midnight). Transient 429 → short cooldown.
   entry.rateLimitedUntil = kind === 'quota' ? nextUtcMidnight(now) : now + 15 * 60 * 1000;
   entry.lastKind = kind;
   state[id] = entry;
@@ -153,8 +159,6 @@ function markUsed(state, id, now) {
   entry.failures = 0;
   state[id] = entry;
 }
-
-// Usable accounts, least-recently-used first; plus soonest reset if none usable.
 function orderAccounts(accounts, state, now) {
   const usable = accounts.filter(a => !(state[a.id]?.rateLimitedUntil > now));
   usable.sort((x, y) => (state[x.id]?.lastUsed ?? 0) - (state[y.id]?.lastUsed ?? 0));
@@ -177,14 +181,23 @@ function classifyFailure(status, text) {
   if (quotaHint || b.includes('rate limit') || b.includes('too many')) return 'quota';
   return 'other';
 }
-
-// Inspect the first SSE chunk for an embedded quota/limit error (no answer yet).
 function firstChunkLooksExhausted(text) {
   if (!text) return false;
-  if (text.includes('"response.created"') || text.includes('"choices"')) return false; // normal start
+  if (text.includes('"response.created"') || text.includes('"choices"')) return false;
   const b = text.toLowerCase();
   return b.includes('error') && (b.includes('quota') || b.includes('limit') ||
          b.includes('rate') || b.includes('exceed') || b.includes('forbidden'));
+}
+
+// ─── Toast notifications ─────────────────────────────────────────────────────────
+
+let toastClient = null;        // set from plugin input
+let lastServedAccountId = null; // only notify on change
+
+function notify(message, variant = 'info', title = 'Qwen Chat') {
+  try {
+    toastClient?.tui?.showToast({ body: { title, message, variant, duration: 4000 } })?.catch?.(() => {});
+  } catch { /* toasts are best-effort */ }
 }
 
 // ─── Request helpers ───────────────────────────────────────────────────────────
@@ -322,7 +335,6 @@ function transformQwenSSE(body, model) {
   }));
 }
 
-// Re-prepend an already-read first chunk to the rest of the reader's stream.
 function restitchStream(firstValue, reader) {
   return new ReadableStream({
     start(c) { if (firstValue) c.enqueue(firstValue); },
@@ -340,6 +352,7 @@ function restitchStream(firstValue, reader) {
 async function qwenFetch(storedToken, input, init) {
   const accounts = collectAccounts(storedToken);
   if (accounts.length === 0) {
+    notify('No valid Qwen accounts found. Log into chat.qwen.ai in Firefox.', 'error');
     return new Response(
       JSON.stringify({ error: { message: 'No valid Qwen accounts. Log into chat.qwen.ai in Firefox, or add tokens to ~/.config/opencode/qwen-accounts.json', type: 'auth_error' } }),
       { status: 401, headers: { 'content-type': 'application/json' } }
@@ -362,6 +375,7 @@ async function qwenFetch(storedToken, input, init) {
 
   if (usable.length === 0) {
     const mins = Number.isFinite(soonestReset) ? Math.ceil((soonestReset - now) / 60000) : null;
+    notify(`All ${accounts.length} account(s) rate-limited${mins != null ? `; reset in ~${mins} min` : ''}.`, 'error');
     return new Response(
       JSON.stringify({ error: { message: `All ${accounts.length} Qwen account(s) are rate-limited${mins != null ? `; next reset in ~${mins} min` : ''}. Add another account to ~/.config/opencode/qwen-accounts.json or log into another account in a separate Firefox profile.`, type: 'rate_limit_error' } }),
       { status: 429, headers: { 'content-type': 'application/json' } }
@@ -370,9 +384,9 @@ async function qwenFetch(storedToken, input, init) {
 
   let lastErr = null;
   for (const account of usable) {
-    const { id, token } = account;
+    const { id, token, label } = account;
+    const isFailover = lastServedAccountId !== null && lastServedAccountId !== id && lastErr !== null;
 
-    // 1) create chat session
     let chatId;
     try {
       chatId = await createChatSession(token, model);
@@ -380,12 +394,12 @@ async function qwenFetch(storedToken, input, init) {
       const kind = classifyFailure(err.status ?? 0, err.body ?? err.message);
       if (kind === 'quota' || kind === 'rate_limit') {
         markRateLimited(state, id, kind, now); saveState(state);
-        lastErr = err; continue; // rotate
+        notify(`${label} hit its limit — switching account…`, 'warning');
+        lastErr = err; continue;
       }
-      lastErr = err; continue; // transient — try next account too
+      lastErr = err; continue;
     }
 
-    // 2) completions (streaming)
     let response;
     try {
       response = await fetch(`${QWEN_BASE}/api/v2/chat/completions?chat_id=${chatId}`, {
@@ -404,7 +418,8 @@ async function qwenFetch(storedToken, input, init) {
       const kind = classifyFailure(response.status, text);
       if (kind === 'quota' || kind === 'rate_limit') {
         markRateLimited(state, id, kind, now); saveState(state);
-        lastErr = new Error(`Qwen ${response.status}`); continue; // rotate
+        notify(`${label} hit its limit — switching account…`, 'warning');
+        lastErr = new Error(`Qwen ${response.status}`); continue;
       }
       return new Response(
         JSON.stringify({ error: { message: `Qwen ${response.status}: ${text.slice(0, 300)}`, type: 'api_error' } }),
@@ -412,19 +427,24 @@ async function qwenFetch(storedToken, input, init) {
       );
     }
 
-    // 3) peek first chunk for an embedded quota/limit error
     const reader = response.body.getReader();
     const first = await reader.read();
     const firstText = first.value ? new TextDecoder().decode(first.value) : '';
     if (firstChunkLooksExhausted(firstText)) {
       markRateLimited(state, id, 'quota', now); saveState(state);
-      lastErr = new Error('quota error in stream'); 
+      notify(`${label} hit its limit — switching account…`, 'warning');
+      lastErr = new Error('quota error in stream');
       try { await reader.cancel(); } catch {}
-      continue; // rotate
+      continue;
     }
 
-    // success — record usage and stream
+    // success
     markUsed(state, id, now); saveState(state);
+    if (lastServedAccountId !== id) {
+      notify(`Using Qwen account: ${label}`, isFailover ? 'success' : 'info');
+      lastServedAccountId = id;
+    }
+
     const stitched = restitchStream(first.value, reader);
     return new Response(transformQwenSSE(stitched, model), {
       status: 200,
@@ -432,11 +452,12 @@ async function qwenFetch(storedToken, input, init) {
         'content-type': 'text/event-stream; charset=utf-8',
         'cache-control': 'no-cache',
         'x-accel-buffering': 'no',
-        'x-qwen-account': id, // debugging: which account served the request
+        'x-qwen-account': id,
       },
     });
   }
 
+  notify(`All Qwen accounts failed: ${lastErr?.message ?? 'unknown'}`, 'error');
   return new Response(
     JSON.stringify({ error: { message: `All Qwen accounts failed. Last error: ${lastErr?.message ?? 'unknown'}`, type: 'api_error' } }),
     { status: 502, headers: { 'content-type': 'application/json' } }
@@ -445,7 +466,9 @@ async function qwenFetch(storedToken, input, init) {
 
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
-export default async function (_input) {
+export default async function (input) {
+  toastClient = input?.client ?? null;
+
   return {
     auth: {
       provider: PROVIDER_ID,
@@ -456,8 +479,8 @@ export default async function (_input) {
         const accounts = collectAccounts(storedToken);
         if (accounts.length === 0) return null;
         return {
-          apiKey: accounts[0].token, // primary; rotation happens inside fetch
-          fetch: (input, init) => qwenFetch(storedToken, input, init),
+          apiKey: accounts[0].token,
+          fetch: (input2, init) => qwenFetch(storedToken, input2, init),
         };
       },
 

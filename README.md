@@ -179,6 +179,20 @@ account id embedded in each session JWT:
 - The response includes an `x-qwen-account` header showing which account served it (handy
   for debugging).
 
+### Toast notifications
+
+The plugin shows OpenCode toast notifications so you always know which account is active:
+
+- **info** — "Using Qwen account: `<label>`" the first time an account serves you (labels
+  are the Firefox profile name, e.g. *Firefox: default-release*, or a name you set in the
+  accounts file).
+- **warning** — "`<label>` hit its limit — switching account…" on a failover.
+- **success** — "Using Qwen account: `<label>`" after a successful failover to a new account.
+- **error** — when all accounts are rate-limited or every account failed.
+
+Notifications only fire when the active account *changes*, so normal back-to-back messages
+stay quiet.
+
 ### Limitations of rotation
 
 - Detection heuristics are best-effort — Qwen's exact "out of free usage" response isn't
