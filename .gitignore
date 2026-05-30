@@ -12,6 +12,10 @@ auth.json
 *-auth-accounts.json
 oauth_creds.json
 
+# Multi-account: real tokens + rate-limit state (never commit)
+qwen-accounts.json
+qwen-accounts-state.json
+
 # OpenCode local state
 opencode.json
 opencode.jsonc

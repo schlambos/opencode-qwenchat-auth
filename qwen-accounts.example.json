@@ -1,0 +1,9 @@
+{
+  "//": "Copy to ~/.config/opencode/qwen-accounts.json and add session tokens from extra Qwen accounts.",
+  "//tokens": "Each token is the 'token' cookie value from chat.qwen.ai for a different account.",
+  "//note": "NEVER commit your real qwen-accounts.json — it contains live session tokens.",
+  "tokens": [
+    "REPLACE_WITH_TOKEN_COOKIE_FROM_ACCOUNT_1",
+    "REPLACE_WITH_TOKEN_COOKIE_FROM_ACCOUNT_2"
+  ]
+}

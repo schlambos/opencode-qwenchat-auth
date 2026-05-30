@@ -106,8 +106,8 @@ Qwen's internal web chat API.
 
    - Select **Other**
    - Provider id: `qwen-chat`
-   - Choose **Qwen Chat (reads session from Firefox)**
-   - It authorizes automatically from your Firefox session.
+   - Choose **Qwen Chat (multi-account, reads Firefox sessions)**
+   - It authorizes automatically from your Firefox session(s).
 
 5. **Use it:**
 
@@ -139,6 +139,53 @@ Qwen's internal web chat API.
 | `qwen3.6-27b` | 256K | Open-weight dense |
 
 Model IDs match chat.qwen.ai's internal names and may change as Qwen updates them.
+
+---
+
+## Multi-account rotation (experimental — `multi-auth` branch)
+
+When one Qwen account hits its free-usage limit, the plugin can automatically fail over to
+another account so you keep working.
+
+### Where accounts come from
+
+The plugin collects candidate accounts from **two** sources and de-duplicates them by the
+account id embedded in each session JWT:
+
+1. **Every Firefox profile** — log a different Qwen account into each Firefox profile
+   (`about:profiles` → *Create a New Profile*), and each profile's `cookies.sqlite` is read.
+2. **A manual accounts file** — `~/.config/opencode/qwen-accounts.json`:
+
+   ```json
+   { "tokens": ["<token-cookie-account-1>", "<token-cookie-account-2>"] }
+   ```
+
+   See [`qwen-accounts.example.json`](./qwen-accounts.example.json). **Never commit this
+   file** — it holds live session tokens (the `.gitignore` already blocks it).
+
+### How rotation works
+
+- Per-account rate-limit state is tracked in `~/.config/opencode/qwen-accounts-state.json`
+  (account id + cooldown timestamp only — no tokens).
+- On each request the plugin picks the **least-recently-used** account that isn't cooling
+  down.
+- A request fails over to the next account when it detects exhaustion via:
+  - HTTP `429` (transient → 15-min cooldown)
+  - HTTP `429/403/401` whose body mentions quota/limit/exceeded (→ cooldown until the next
+    **UTC midnight**, matching Qwen's daily free-tier reset)
+  - a quota/limit error in the first SSE chunk before any answer text
+- If **all** accounts are cooling down, you get a `429` telling you when the soonest one
+  resets.
+- The response includes an `x-qwen-account` header showing which account served it (handy
+  for debugging).
+
+### Limitations of rotation
+
+- Detection heuristics are best-effort — Qwen's exact "out of free usage" response isn't
+  publicly documented, so classification keys off HTTP status + body/SSE text scanning.
+- Cooldown assumes a daily UTC reset; tune in `markRateLimited()` if Qwen differs.
+- Firefox only stores one live session per profile, so multiple accounts require multiple
+  profiles and/or the accounts file.
 
 ---
 
