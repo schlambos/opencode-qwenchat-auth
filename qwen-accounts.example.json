@@ -1,9 +1,21 @@
 {
   "//": "Copy to ~/.config/opencode/qwen-accounts.json and add session tokens from extra Qwen accounts.",
   "//tokens": "Each token is the 'token' cookie value from chat.qwen.ai for a different account.",
+  "//objects": "Entries may also be objects: { token, label, bxUa, bxUmidToken }.",
+  "//bx": "Top-level bxUa / bxUmidToken are OPTIONAL anti-bot headers applied to all accounts. Only needed if Qwen starts returning WAF challenges; grab fresh values from a real chat.qwen.ai request in browser devtools (Network > request headers: bx-ua, bx-umidtoken).",
   "//note": "NEVER commit your real qwen-accounts.json — it contains live session tokens.",
+
   "tokens": [
     "REPLACE_WITH_TOKEN_COOKIE_FROM_ACCOUNT_1",
     "REPLACE_WITH_TOKEN_COOKIE_FROM_ACCOUNT_2"
-  ]
+  ],
+
+  "//example-object-form": "Alternatively:",
+  "//accounts": [
+    { "token": "TOKEN_COOKIE_1", "label": "work" },
+    { "token": "TOKEN_COOKIE_2", "label": "personal" }
+  ],
+
+  "bxUa": "OPTIONAL_PASTE_bx-ua_HEADER_VALUE_HERE",
+  "bxUmidToken": "OPTIONAL_PASTE_bx-umidtoken_HEADER_VALUE_HERE"
 }

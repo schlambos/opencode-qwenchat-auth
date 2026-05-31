@@ -35,6 +35,9 @@ Build mode works.
 2. **Per request** — It re-reads the freshest token from Firefox (cached briefly, and
    treated as expired ~1 min before the JWT `exp`), so as long as you stay logged in to
    chat.qwen.ai in Firefox, it keeps working. Token expiry is parsed from the JWT itself.
+   It replays the **full cookie jar** for the profile (`token`, `acw_tc`, `cna`, `tfstk`,
+   `ssxmod_*`, …), matching the real browser client and preserving WAF/load-balancer
+   affinity cookies.
 3. **Request translation** — Qwen's web endpoint hangs on multi-message threaded input,
    so the plugin **collapses the OpenAI conversation into a single user message** per
    request — but it preserves structure by labeling each turn (`[System]`, `[User]`,
@@ -137,6 +140,18 @@ Build mode works.
   plugin picks up the new one automatically on the next request.
 - If you get a `401`/auth error, just reload chat.qwen.ai in Firefox and retry.
 
+### Troubleshooting: WAF challenges
+
+If requests start failing with a `waf_challenge` error (*"Qwen anti-bot (WAF) challenge…"*),
+Qwen's Aliyun WAF has flagged the traffic. This is **not** a quota or account problem, and
+switching accounts won't help (it's device/IP-level). Fix it by:
+
+1. Open <https://chat.qwen.ai> in Firefox and send a message — solve any captcha.
+2. Reload the page so fresh affinity cookies (`acw_tc`, `tfstk`, …) are written; the plugin
+   picks them up automatically.
+3. If it still fails, capture `bx-ua` and `bx-umidtoken` from a real browser request and add
+   them to `qwen-accounts.json` (see [Optional: anti-bot headers](#optional-anti-bot-headers-bx-ua--bx-umidtoken)).
+
 ---
 
 ## Models
@@ -213,14 +228,31 @@ account id embedded in each session JWT:
    (`about:profiles` → *Create a New Profile*), and each profile's `cookies.sqlite` is read.
 2. **A manual accounts file** — `~/.config/opencode/qwen-accounts.json`. Accepts either a
    bare array or a `{ "tokens": [...] }` object, and each entry may be a raw token string
-   or `{ "token": "...", "label": "..." }`:
+   or `{ "token": "...", "label": "...", "bxUa": "...", "bxUmidToken": "..." }`:
 
    ```json
    { "tokens": ["<token-cookie-account-1>", "<token-cookie-account-2>"] }
    ```
 
-   See [`qwen-accounts.example.json`](./qwen-accounts.example.json). **Never commit this
-   file** — it holds live session tokens (the `.gitignore` already blocks it).
+   Manual tokens are sent token-only (no jar), since the extra cookies live in the browser
+   profile, not the file. See [`qwen-accounts.example.json`](./qwen-accounts.example.json).
+   **Never commit this file** — it holds live session tokens (the `.gitignore` already
+   blocks it).
+
+### Optional: anti-bot headers (`bx-ua` / `bx-umidtoken`)
+
+Qwen sits behind an Aliyun WAF. Today the cookie/`token` auth is enough, but if Qwen
+starts enforcing its anti-bot layer you'll see WAF challenges (see [Troubleshooting]
+(#troubleshooting-waf-challenges)). As a hedge you can capture those two request headers
+from a real browser request (devtools → Network → a `chat.qwen.ai` request → Request
+Headers) and add them top-level in `qwen-accounts.json`:
+
+```json
+{ "tokens": ["…"], "bxUa": "<bx-ua value>", "bxUmidToken": "<bx-umidtoken value>" }
+```
+
+When present they're attached to every request. They can also be set per-account on an
+object-form entry.
 
 ### How rotation works
 
@@ -270,6 +302,8 @@ stay quiet.
 - **Tool calling is prompt-based, not native:** reliability depends on the model following
   the injected protocol (see [Tool calling](#tool-calling)).
 - **Text only:** image/audio passthrough is not implemented.
+- **Token usage** is forwarded to OpenCode (mapped from Qwen's `usage` block), so token
+  counts are reported; cost stays `0` since the web tier is free.
 - **Firefox only:** reads from Firefox's cookie store. Chrome/Safari would need a
   different cookie path and decryption (PRs welcome).
 - **Unofficial:** this uses Qwen's private web API. It can break if Qwen changes it, and

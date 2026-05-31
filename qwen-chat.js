@@ -72,25 +72,59 @@ function listFirefoxCookieDbs() {
     .filter(x => existsSync(x.path));
 }
 
-function readTokenFromCookieDb(dbPath, idx) {
+function readQwenCookies(dbPath, idx) {
+  // Returns { token, cookieHeader } for the freshest qwen.ai session in this DB, or null.
+  // cookieHeader replays the FULL Cookie: string the browser would send (acw_tc, cna,
+  // tfstk, ssxmod_*, …) — not just the token — so we match the live client and keep
+  // WAF/load-balancer affinity cookies intact.
   try {
     const tmp = join(tmpdir(), `qwen-ff-cookies-${idx}.sqlite`);
     copyFileSync(dbPath, tmp);
-    const result = execSync(
-      `sqlite3 "${tmp}" "SELECT value FROM moz_cookies WHERE host LIKE '%.qwen.ai' AND name='token' ORDER BY lastAccessed DESC LIMIT 1;"`,
+    const out = execSync(
+      `sqlite3 "${tmp}" "SELECT name, value FROM moz_cookies WHERE host LIKE '%qwen.ai%' ORDER BY lastAccessed DESC;"`,
       { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
-    ).trim();
-    return result || null;
+    );
+    const seen = new Map();
+    for (const line of out.split('\n')) {
+      if (!line) continue;
+      const i = line.indexOf('|');           // cookie names never contain '|'
+      if (i < 0) continue;
+      const name = line.slice(0, i);
+      if (!seen.has(name)) seen.set(name, line.slice(i + 1)); // first row = most recent
+    }
+    const token = seen.get('token');
+    if (!token) return null;
+    const cookieHeader = [...seen.entries()].map(([n, v]) => `${n}=${v}`).join('; ');
+    return { token, cookieHeader };
   } catch { return null; }
+}
+
+// Back-compat helper used where only the token (not the jar) is needed.
+function readTokenFromCookieDb(dbPath, idx) {
+  return readQwenCookies(dbPath, idx)?.token ?? null;
 }
 
 function readFirefoxTokens() {
   const out = [];
   listFirefoxCookieDbs().forEach((db, i) => {
-    const t = readTokenFromCookieDb(db.path, i);
-    if (t) out.push({ token: t, label: `Firefox: ${db.label}` });
+    const c = readQwenCookies(db.path, i);
+    if (c) out.push({ token: c.token, label: `Firefox: ${db.label}`, cookieHeader: c.cookieHeader });
   });
   return out;
+}
+
+function readBxOverride() {
+  // bx-ua / bx-umidtoken are JS-generated anti-bot headers we can't read from the cookie
+  // store. Allow pasting them (top-level) into qwen-accounts.json as a hedge for when Qwen
+  // enforces its WAF. Applied to every account unless an account overrides them.
+  try {
+    if (!existsSync(ACCOUNTS_FILE)) return {};
+    const raw = JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf8'));
+    return {
+      bxUa: raw?.bxUa ?? raw?.['bx-ua'] ?? null,
+      bxUmidToken: raw?.bxUmidToken ?? raw?.['bx-umidtoken'] ?? null,
+    };
+  } catch { return {}; }
 }
 
 function readAccountsFileTokens() {
@@ -99,16 +133,23 @@ function readAccountsFileTokens() {
     const raw = JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf8'));
     const list = Array.isArray(raw) ? raw : Array.isArray(raw.tokens) ? raw.tokens : [];
     return list
-      .map(t => (typeof t === 'string' ? { token: t } : { token: t?.token, label: t?.label }))
-      .filter(x => x.token)
-      .map(x => ({ token: x.token, label: x.label ? `File: ${x.label}` : 'File' }));
+      .map(t => (typeof t === 'string' ? { token: t } : t))
+      .filter(x => x?.token)
+      .map(x => ({
+        token: x.token,
+        label: x.label ? `File: ${x.label}` : 'File',
+        // A manual token has no associated jar; send token-only unless the user supplied one.
+        cookieHeader: x.cookie ?? x.cookieHeader ?? `token=${x.token}`,
+        bxUa: x.bxUa ?? x['bx-ua'] ?? null,
+        bxUmidToken: x.bxUmidToken ?? x['bx-umidtoken'] ?? null,
+      }));
   } catch { return []; }
 }
 
 function getTokenFromFirefox() {
   const dbs = listFirefoxCookieDbs();
   for (let i = 0; i < dbs.length; i++) {
-    const t = readTokenFromCookieDb(dbs[i].path, i);
+    const t = readQwenCookies(dbs[i].path, i)?.token;
     if (t && tokenIsValid(t)) return t;
   }
   return null;
@@ -120,6 +161,7 @@ let accountsCacheTime = 0;
 function collectAccounts(storedToken) {
   if (accountsCache && Date.now() - accountsCacheTime < 10_000) return accountsCache;
 
+  const bx = readBxOverride();
   const raw = [
     ...readFirefoxTokens(),
     ...readAccountsFileTokens(),
@@ -127,13 +169,20 @@ function collectAccounts(storedToken) {
   ];
 
   const byId = new Map();
-  for (const { token, label } of raw) {
+  for (const acct of raw) {
+    const { token, label } = acct;
     if (!tokenIsValid(token)) continue;
     const id = accountIdOf(token);
     const exp = jwtExpiry(token) ?? 0;
     const existing = byId.get(id);
     if (!existing || exp > existing.exp) {
-      byId.set(id, { id, token, exp, label: label ?? `Account ${shortId(id)}` });
+      byId.set(id, {
+        id, token, exp,
+        label: label ?? `Account ${shortId(id)}`,
+        cookieHeader: acct.cookieHeader ?? `token=${token}`,
+        bxUa: acct.bxUa ?? bx.bxUa ?? null,
+        bxUmidToken: acct.bxUmidToken ?? bx.bxUmidToken ?? null,
+      });
     }
   }
 
@@ -188,7 +237,21 @@ function orderAccounts(accounts, state, now) {
 
 // ─── Failure classification ──────────────────────────────────────────────────────
 
+function looksLikeWaf(text) {
+  // Aliyun/Baxia anti-bot challenges return HTML or a captcha/punish payload on an
+  // endpoint that should always return JSON. Detect that so we don't misread it as
+  // an auth/quota failure (and so we don't pointlessly fail over — WAF is device/IP
+  // level, not per-account).
+  const b = (text || '').toLowerCase();
+  if (!b) return false;
+  if (b.includes('<html') || b.includes('<!doctype')) return true;
+  return b.includes('slidecaptcha') || b.includes('captcha') || b.includes('x5sec') ||
+         b.includes('punish') || b.includes('baxia') || b.includes('/_____tmd_____/') ||
+         (b.includes('blocked') && b.includes('request'));
+}
+
 function classifyFailure(status, text) {
+  if (looksLikeWaf(text)) return 'waf';
   const b = (text || '').toLowerCase();
   const quotaHint = b.includes('quota') || b.includes('exceed') || b.includes('insufficient') ||
                     b.includes('out of') || b.includes('daily limit') || b.includes('free');
@@ -196,6 +259,20 @@ function classifyFailure(status, text) {
   if (status === 401 || status === 403) return quotaHint ? 'quota' : 'auth';
   if (quotaHint || b.includes('rate limit') || b.includes('too many')) return 'quota';
   return 'other';
+}
+
+function wafResponse() {
+  notify('Qwen WAF challenge — open chat.qwen.ai in Firefox to refresh your session.', 'error');
+  return new Response(
+    JSON.stringify({ error: {
+      message: 'Qwen anti-bot (WAF) challenge. Open chat.qwen.ai in Firefox, solve any ' +
+        'captcha, and reload so fresh cookies are stored, then retry. If it persists, ' +
+        'capture bx-ua / bx-umidtoken from the browser request headers and add them to ' +
+        '~/.config/opencode/qwen-accounts.json.',
+      type: 'waf_challenge',
+    } }),
+    { status: 403, headers: { 'content-type': 'application/json' } }
+  );
 }
 
 // ─── Toast notifications ─────────────────────────────────────────────────────────
@@ -211,7 +288,7 @@ function notify(message, variant = 'info', title = 'Qwen Chat') {
 
 // ─── Request helpers ───────────────────────────────────────────────────────────
 
-function buildHeaders(token, extra = {}) {
+function buildHeaders(cookieHeader, extra = {}) {
   return {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0',
     'Accept': 'text/event-stream, application/json, text/plain, */*',
@@ -224,15 +301,24 @@ function buildHeaders(token, extra = {}) {
     'bx-v': '2.5.36',
     'Origin': QWEN_BASE,
     'Referer': `${QWEN_BASE}/`,
-    'Cookie': `token=${token}`,
+    'Cookie': cookieHeader,
     ...extra,
   };
 }
 
-async function createChatSession(token, model, signal) {
+// Build request headers for a specific account: its full cookie jar plus any optional
+// bx-ua / bx-umidtoken anti-bot headers the user supplied.
+function accountHeaders(account, extra = {}) {
+  const h = { ...extra };
+  if (account.bxUa) h['bx-ua'] = account.bxUa;
+  if (account.bxUmidToken) h['bx-umidtoken'] = account.bxUmidToken;
+  return buildHeaders(account.cookieHeader ?? `token=${account.token}`, h);
+}
+
+async function createChatSession(account, model, signal) {
   const res = await fetch(`${QWEN_BASE}/api/v2/chats/new`, {
     method: 'POST',
-    headers: buildHeaders(token),
+    headers: accountHeaders(account),
     signal,
     body: JSON.stringify({
       title: 'OpenCode', models: [model], chat_mode: 'normal',
@@ -477,11 +563,26 @@ function extractToolCalls(text, toolNames) {
 // ─── SSE transform (streaming pass-through) ─────────────────────────────────────
 // Translates Qwen's phase-based SSE to OpenAI chunk format in real time.
 
-function makeChunk(id, created, model, delta, finishReason) {
-  return `data: ${JSON.stringify({
+function makeChunk(id, created, model, delta, finishReason, usage) {
+  const obj = {
     id, object: 'chat.completion.chunk', created, model,
     choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
-  })}\n\n`;
+  };
+  if (usage) obj.usage = usage;
+  return `data: ${JSON.stringify(obj)}\n\n`;
+}
+
+// Map Qwen's usage block to OpenAI's. Qwen sends input_tokens/output_tokens/total_tokens.
+function mapUsage(u) {
+  if (!u) return null;
+  const prompt = u.input_tokens ?? u.prompt_tokens;
+  const completion = u.output_tokens ?? u.completion_tokens;
+  if (prompt == null && completion == null) return null;
+  return {
+    prompt_tokens: prompt ?? 0,
+    completion_tokens: completion ?? 0,
+    total_tokens: u.total_tokens ?? ((prompt ?? 0) + (completion ?? 0)),
+  };
 }
 
 function transformQwenSSE(body, model) {
@@ -492,6 +593,7 @@ function transformQwenSSE(body, model) {
   let buffer = '';
   let sentRole = false;
   let sentDone = false;
+  let usage = null;
 
   return body.pipeThrough(new TransformStream({
     transform(chunk, controller) {
@@ -504,6 +606,7 @@ function transformQwenSSE(body, model) {
         if (!raw || raw.startsWith('{"response.created"')) continue;
         let parsed;
         try { parsed = JSON.parse(raw); } catch { continue; }
+        if (parsed.usage) usage = parsed.usage;   // keep the latest reported usage
         const delta = parsed.choices?.[0]?.delta;
         if (!delta) continue;
         const { phase, status, content } = delta;
@@ -514,7 +617,7 @@ function transformQwenSSE(body, model) {
           sentRole = true;
         }
         if (status === 'finished') {
-          controller.enqueue(encoder.encode(makeChunk(id, created, model, {}, 'stop')));
+          controller.enqueue(encoder.encode(makeChunk(id, created, model, {}, 'stop', mapUsage(usage))));
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
           sentDone = true;
         } else if (content) {
@@ -527,7 +630,7 @@ function transformQwenSSE(body, model) {
         if (!sentRole) {
           controller.enqueue(encoder.encode(makeChunk(id, created, model, { role: 'assistant', content: '' }, null)));
         }
-        controller.enqueue(encoder.encode(makeChunk(id, created, model, {}, 'stop')));
+        controller.enqueue(encoder.encode(makeChunk(id, created, model, {}, 'stop', mapUsage(usage))));
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));
       }
     },
@@ -568,7 +671,7 @@ function sseStreamFrom(chunks) {
   });
 }
 
-function contentResponseChunks(text, model) {
+function contentResponseChunks(text, model, usage) {
   if (!text) {
     // Qwen sent empty content — still emit valid SSE so OpenCode doesn't hang
     text = '[empty response]';
@@ -578,12 +681,12 @@ function contentResponseChunks(text, model) {
   return [
     makeChunk(id, created, model, { role: 'assistant', content: '' }, null),
     makeChunk(id, created, model, { content: text }, null),
-    makeChunk(id, created, model, {}, 'stop'),
+    makeChunk(id, created, model, {}, 'stop', usage),
     'data: [DONE]\n\n',
   ];
 }
 
-function toolCallResponseChunks(calls, model) {
+function toolCallResponseChunks(calls, model, usage) {
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
   const tool_calls = calls.map((c, i) => ({
@@ -595,13 +698,17 @@ function toolCallResponseChunks(calls, model) {
       arguments: typeof c.arguments === 'string' ? c.arguments : JSON.stringify(c.arguments ?? {}),
     },
   }));
-  const mk = (delta, finish) => `data: ${JSON.stringify({
-    id, object: 'chat.completion.chunk', created, model,
-    choices: [{ index: 0, delta, finish_reason: finish ?? null }],
-  })}\n\n`;
+  const mk = (delta, finish, u) => {
+    const obj = {
+      id, object: 'chat.completion.chunk', created, model,
+      choices: [{ index: 0, delta, finish_reason: finish ?? null }],
+    };
+    if (u) obj.usage = u;
+    return `data: ${JSON.stringify(obj)}\n\n`;
+  };
   return [
     mk({ role: 'assistant', tool_calls }, null),
-    mk({}, 'tool_calls'),
+    mk({}, 'tool_calls', usage),
     'data: [DONE]\n\n',
   ];
 }
@@ -692,10 +799,11 @@ async function qwenFetch(storedToken, input, init) {
     const timer = setTimeout(() => abort.abort(new Error('Request timeout')), REQUEST_TIMEOUT_MS);
     let chatId;
     try {
-      chatId = await createChatSession(token, model, abort.signal);
+      chatId = await createChatSession(account, model, abort.signal);
     } catch (err) {
       clearTimeout(timer);
       const kind = classifyFailure(err.status ?? 0, err.body ?? err.message);
+      if (kind === 'waf') return wafResponse();
       if (kind === 'quota' || kind === 'rate_limit') {
         markRateLimited(state, id, kind, now); saveState(state);
         invalidateCache();
@@ -710,7 +818,7 @@ async function qwenFetch(storedToken, input, init) {
       response = await fetch(`${QWEN_BASE}/api/v2/chat/completions?chat_id=${chatId}`, {
         method: 'POST',
         signal: abort.signal,
-        headers: buildHeaders(token),
+        headers: accountHeaders(account),
         body: JSON.stringify({
           stream: true, version: '2.1', incremental_output: true, chat_id: chatId,
           chat_mode: 'normal', model, parent_id: null,
@@ -726,6 +834,7 @@ async function qwenFetch(storedToken, input, init) {
     if (!response.ok) {
       const text = await response.text();
       const kind = classifyFailure(response.status, text);
+      if (kind === 'waf') return wafResponse();
       if (kind === 'quota' || kind === 'rate_limit') {
         markRateLimited(state, id, kind, now); saveState(state);
         invalidateCache();
@@ -741,6 +850,11 @@ async function qwenFetch(storedToken, input, init) {
     const reader = response.body.getReader();
     const first = await reader.read();
     const firstText = first.value ? new TextDecoder().decode(first.value) : '';
+    // A 200 that's actually an HTML/captcha challenge → treat as WAF, not a stream.
+    if (looksLikeWaf(firstText)) {
+      try { await reader.cancel(); } catch {}
+      return wafResponse();
+    }
     if (firstChunkLooksExhausted(firstText)) {
       markRateLimited(state, id, 'quota', now); saveState(state);
       invalidateCache();
@@ -765,17 +879,19 @@ async function qwenFetch(storedToken, input, init) {
 
     // Tool mode: stream answer text as it arrives, then at the end check for tool calls
     if (wantTools) {
-      const answer = await collectAnswerText(first.value, reader);
+      const { answer, usage } = await collectAnswerText(first.value, reader);
       const calls = extractToolCalls(answer, toolNames);
       dbg({
         phase: 'tool_response', model,
         emitted: calls ? 'tool_calls' : 'content',
         parsed: calls?.map(c => ({ name: c.name, argKeys: Object.keys(c.arguments ?? {}) })) ?? null,
         answerFull: answer,
+        usage: mapUsage(usage),
       });
+      const u = mapUsage(usage);
       const chunks = calls
-        ? toolCallResponseChunks(calls, model)
-        : contentResponseChunks(answer, model);
+        ? toolCallResponseChunks(calls, model, u)
+        : contentResponseChunks(answer, model, u);
       return new Response(sseStreamFrom(chunks), { status: 200, headers: baseHeaders });
     }
 
@@ -798,6 +914,7 @@ async function collectAnswerText(firstValue, reader) {
   let buffer = firstValue ? decoder.decode(firstValue, { stream: true }) : '';
   let answer = '';
   let finished = false;
+  let usage = null;
   const drain = () => {
     const lines = buffer.split('\n');
     buffer = lines.pop() ?? '';
@@ -806,7 +923,9 @@ async function collectAnswerText(firstValue, reader) {
       const raw = line.slice(6).trim();
       if (!raw || raw.startsWith('{"response.created"')) continue;
       try {
-        const d = JSON.parse(raw).choices?.[0]?.delta;
+        const parsed = JSON.parse(raw);
+        if (parsed.usage) usage = parsed.usage;
+        const d = parsed.choices?.[0]?.delta;
         if (d?.phase === 'answer') {
           answer += d.content ?? '';
           if (d.status === 'finished') finished = true;
@@ -826,7 +945,7 @@ async function collectAnswerText(firstValue, reader) {
   }
   // Release the connection so the request doesn't dangle until timeout.
   try { await reader.cancel(); } catch {}
-  return answer;
+  return { answer, usage };
 }
 
 function firstChunkLooksExhausted(text) {
