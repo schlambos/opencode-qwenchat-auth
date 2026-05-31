@@ -16,6 +16,10 @@ oauth_creds.json
 qwen-accounts.json
 qwen-accounts-state.json
 
+# Diagnostic logs
+qwen-chat-debug
+qwen-chat-debug.log
+
 # OpenCode local state
 opencode.json
 opencode.jsonc

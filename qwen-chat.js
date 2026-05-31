@@ -293,6 +293,7 @@ function buildToolPrompt(messages, tools) {
   const sys = [];
   const convo = [];
   const idToName = {};
+  const toolNames = new Set((tools ?? []).map(t => (t.function?.name ?? t.name)).filter(Boolean));
   for (const m of messages) {
     if (m.role === 'system') {
       const t = contentToString(m.content).trim();
@@ -342,7 +343,13 @@ function buildToolPrompt(messages, tools) {
   }
   if (convo.length > 1) p += '--- Conversation so far ---\n\n';
   p += convo.join('\n\n');
-  if (tools?.length) p += '\n\nRespond now with either a tool_call block or your final answer.';
+  if (tools?.length) {
+    p += '\n\n--- CRITICAL REMINDER (re-read before responding) ---\n\n';
+    p += `You have ${tools.length} tool(s) available: ${[...toolNames].join(', ')}.\n`;
+    p += 'If you need a file or shell output, you MUST call a tool using the fenced tool_call block above.\n';
+    p += 'Do NOT assume tools are unavailable. Do NOT reply with "Tool X does not exist" or "I don\'t have access to tools" or similar — those statements are wrong and forbidden.\n';
+    p += 'If you cannot proceed without calling a tool, emit a tool_call block. Do not ask the user for file contents.';
+  }
   return p;
 }
 
@@ -443,6 +450,19 @@ function extractToolCalls(text, toolNames) {
   if (json) return json;
   const arg = parseArgBlock(text, toolNames);
   if (arg) return arg;
+
+  // Last-resort heuristic: if the model mentions tools by name in prose like
+  // "Tool read does not exists." (it's hallucinating that tools are unavailable),
+  // extract the tool names so we can at least log them. We DO NOT synthesize calls
+  // from this pattern — no args to extract — but the diagnostic log will flag it.
+  const mentioned = new Set();
+  for (const line of text.split('\n')) {
+    const m2 = line.match(/\bTool\s+(?:read|bash|glob|grep|write|edit|task|webfetch|todowrite|question|skill|google_search|mystatus)\b/i);
+    if (m2) mentioned.add(m2[1]?.toLowerCase?.() ?? m2[0].split(/\s+/)[1].toLowerCase());
+  }
+  if (mentioned.size) {
+    dbg({ phase: 'hallucinated_tool_mentions', mentioned: [...mentioned], sample: text.slice(0, 400) });
+  }
   return null;
 }
 
@@ -630,6 +650,8 @@ async function qwenFetch(storedToken, input, init) {
     hasToolsField: Array.isArray(body.tools), nTools: (body.tools ?? []).length,
     toolNames: [...toolNames], tool_choice: body.tool_choice ?? null,
     nMessages: messages.length, lastRole: messages[messages.length - 1]?.role ?? null,
+    // Full prompt (helps diagnose history poisoning)
+    promptSent: promptText,
   });
   const promptText = wantTools ? buildToolPrompt(messages, tools) : flattenConversation(messages);
   const userMessage = toQwenMessage({ role: 'user', content: promptText }, model);
@@ -725,7 +747,7 @@ async function qwenFetch(storedToken, input, init) {
         phase: 'tool_response', model,
         emitted: calls ? 'tool_calls' : 'content',
         parsed: calls?.map(c => ({ name: c.name, argKeys: Object.keys(c.arguments ?? {}) })) ?? null,
-        answerSample: answer.slice(0, 1800),
+        answerFull: answer,
       });
       const chunks = calls
         ? toolCallResponseChunks(calls, model)
