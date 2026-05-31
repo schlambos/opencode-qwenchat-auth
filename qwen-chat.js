@@ -1,6 +1,6 @@
 import { randomUUID } from 'crypto';
 import { execSync } from 'child_process';
-import { existsSync, copyFileSync, readdirSync, readFileSync, writeFileSync, appendFileSync } from 'fs';
+import { existsSync, copyFileSync, readdirSync, readFileSync, writeFileSync, appendFileSync, statSync } from 'fs';
 import { homedir, tmpdir } from 'os';
 import { join } from 'path';
 
@@ -10,17 +10,22 @@ const PROVIDER_ID = 'qwen-chat';
 const ACCOUNTS_FILE = join(homedir(), '.config', 'opencode', 'qwen-accounts.json');
 const STATE_FILE = join(homedir(), '.config', 'opencode', 'qwen-accounts-state.json');
 
-// Diagnostic logging — only active when the flag file exists (no tokens are logged).
+// Diagnostic logging with rotation at 1 MB.
 const DEBUG_FLAG = join(homedir(), '.config', 'opencode', 'qwen-chat-debug');
 const DEBUG_LOG = join(homedir(), '.config', 'opencode', 'qwen-chat-debug.log');
+const MAX_LOG_BYTES = 1_048_576;
 let debugEnabled = null;
 function dbg(obj) {
   try {
     if (debugEnabled === null) debugEnabled = existsSync(DEBUG_FLAG);
     if (!debugEnabled) return;
-    appendFileSync(DEBUG_LOG, JSON.stringify({ t: new Date().toISOString(), ...obj }) + '\n');
+    const line = JSON.stringify({ t: new Date().toISOString(), ...obj }) + '\n';
+    appendFileSync(DEBUG_LOG, line);
+    try { if (statSync(DEBUG_LOG).size > MAX_LOG_BYTES) writeFileSync(DEBUG_LOG, line); } catch {}
   } catch { /* ignore */ }
 }
+
+const REQUEST_TIMEOUT_MS = 120_000;
 
 const MODELS = {
   'qwen3.6-plus':        { name: 'Qwen3.6 Plus',        context: 1_000_000, output: 65536 },
@@ -57,8 +62,6 @@ function shortId(id) {
 
 // ─── Token sources ──────────────────────────────────────────────────────────────
 
-// All Firefox profiles (each profile can be a different Qwen account).
-// Returns [{ path, label }] where label is a friendly profile name.
 function listFirefoxCookieDbs() {
   const root = join(homedir(), 'Library/Application Support/Firefox/Profiles');
   if (!existsSync(root)) return [];
@@ -90,8 +93,6 @@ function readFirefoxTokens() {
   return out;
 }
 
-// Optional manual accounts file:
-//   { "tokens": ["eyJ...", { "token": "eyJ...", "label": "work" }] }   (or a bare array)
 function readAccountsFileTokens() {
   try {
     if (!existsSync(ACCOUNTS_FILE)) return [];
@@ -104,7 +105,6 @@ function readAccountsFileTokens() {
   } catch { return []; }
 }
 
-// Single backwards-compatible Firefox token (used by the login flow)
 function getTokenFromFirefox() {
   const dbs = listFirefoxCookieDbs();
   for (let i = 0; i < dbs.length; i++) {
@@ -117,9 +117,8 @@ function getTokenFromFirefox() {
 let accountsCache = null;
 let accountsCacheTime = 0;
 
-// Gather all candidate accounts, dedup by account id, keep the freshest token per id.
 function collectAccounts(storedToken) {
-  if (accountsCache && Date.now() - accountsCacheTime < 30_000) return accountsCache;
+  if (accountsCache && Date.now() - accountsCacheTime < 10_000) return accountsCache;
 
   const raw = [
     ...readFirefoxTokens(),
@@ -143,7 +142,12 @@ function collectAccounts(storedToken) {
   return accountsCache;
 }
 
-// ─── Per-account rate-limit state (persisted) ───────────────────────────────────
+function invalidateCache() {
+  accountsCache = null;
+  accountsCacheTime = 0;
+}
+
+// ─── Per-account rate-limit state ───────────────────────────────────────────────
 
 function loadState() {
   try { return existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, 'utf8')) : {}; }
@@ -161,7 +165,7 @@ function nextUtcMidnight(now) {
 function markRateLimited(state, id, kind, now) {
   const entry = state[id] ?? { failures: 0, lastUsed: 0 };
   entry.failures = (entry.failures ?? 0) + 1;
-  entry.rateLimitedUntil = kind === 'quota' ? nextUtcMidnight(now) : now + 15 * 60 * 1000;
+  entry.rateLimitedUntil = kind === 'quota' ? nextUtcMidnight(now) : now + 60_000;
   entry.lastKind = kind;
   state[id] = entry;
 }
@@ -193,23 +197,16 @@ function classifyFailure(status, text) {
   if (quotaHint || b.includes('rate limit') || b.includes('too many')) return 'quota';
   return 'other';
 }
-function firstChunkLooksExhausted(text) {
-  if (!text) return false;
-  if (text.includes('"response.created"') || text.includes('"choices"')) return false;
-  const b = text.toLowerCase();
-  return b.includes('error') && (b.includes('quota') || b.includes('limit') ||
-         b.includes('rate') || b.includes('exceed') || b.includes('forbidden'));
-}
 
 // ─── Toast notifications ─────────────────────────────────────────────────────────
 
-let toastClient = null;        // set from plugin input
-let lastServedAccountId = null; // only notify on change
+let toastClient = null;
+let lastServedAccountId = null;
 
 function notify(message, variant = 'info', title = 'Qwen Chat') {
   try {
     toastClient?.tui?.showToast({ body: { title, message, variant, duration: 4000 } })?.catch?.(() => {});
-  } catch { /* toasts are best-effort */ }
+  } catch {}
 }
 
 // ─── Request helpers ───────────────────────────────────────────────────────────
@@ -217,7 +214,7 @@ function notify(message, variant = 'info', title = 'Qwen Chat') {
 function buildHeaders(token, extra = {}) {
   return {
     'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0',
-    'Accept': 'application/json, text/plain, */*',
+    'Accept': 'text/event-stream, application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Content-Type': 'application/json',
     'version': '0.2.60',
@@ -232,10 +229,11 @@ function buildHeaders(token, extra = {}) {
   };
 }
 
-async function createChatSession(token, model) {
+async function createChatSession(token, model, signal) {
   const res = await fetch(`${QWEN_BASE}/api/v2/chats/new`, {
     method: 'POST',
     headers: buildHeaders(token),
+    signal,
     body: JSON.stringify({
       title: 'OpenCode', models: [model], chat_mode: 'normal',
       chat_type: 't2t', timestamp: Date.now(), project_id: '',
@@ -257,38 +255,61 @@ function contentToString(content) {
   return String(content ?? '');
 }
 
-function flattenConversation(messages) {
-  const systemParts = [];
-  const convoParts = [];
+// ─── Message/context builder ────────────────────────────────────────────────────
+// Preserves conversation structure for better Qwen comprehension.
+
+function buildPrompt(messages) {
+  const parts = [];
   for (const m of messages) {
     const text = contentToString(m.content).trim();
     if (!text) continue;
-    if (m.role === 'system') systemParts.push(text);
-    else if (m.role === 'assistant') convoParts.push(`Assistant: ${text}`);
-    else if (m.role === 'tool') convoParts.push(`Tool result: ${text}`);
-    else convoParts.push(`User: ${text}`);
+    if (m.role === 'system') {
+      parts.push(`[System]\n${text}`);
+    } else if (m.role === 'assistant') {
+      parts.push(`[Assistant]\n${text}`);
+    } else if (m.role === 'tool') {
+      parts.push(`[Tool Result]\n${text}`);
+    } else {
+      parts.push(`[User]\n${text}`);
+    }
   }
-  let prompt = '';
-  if (systemParts.length) prompt += systemParts.join('\n\n') + '\n\n';
-  if (convoParts.length > 1) prompt += '--- Conversation so far ---\n\n';
-  prompt += convoParts.join('\n\n');
-  return prompt;
+  return parts.join('\n\n---\n\n');
 }
 
-// ─── Tool-call shim (experimental) ──────────────────────────────────────────────
-// Qwen's web API has no native function calling. We inject a text protocol: the model
-// emits a fenced ```tool_call JSON block, which we parse back into OpenAI tool_calls.
+// ─── Tool-call shim ─────────────────────────────────────────────────────────────
+// Qwen's web API has no native function calling. We inject a text protocol:
+// the model emits fenced ```tool_call blocks, which we parse back into
+// OpenAI tool_calls. The prompt is kept SHORT to avoid confusing Qwen into
+// using other formats.
 
 function renderToolsForPrompt(tools) {
   return tools.map(t => {
     const f = t.function ?? t;
-    const props = JSON.stringify(f.parameters?.properties ?? {});
-    const required = (f.parameters?.required ?? []).join(', ');
-    return `- ${f.name}: ${(f.description ?? '').split('\n')[0]}\n    parameters: ${props}${required ? `\n    required: [${required}]` : ''}`;
+    const desc = (f.description ?? '').split('\n')[0].slice(0, 120);
+    const params = f.parameters?.properties ?? {};
+    const required = new Set(f.parameters?.required ?? []);
+    const argLines = Object.entries(params).map(([name, spec]) => {
+      const type = spec?.type ?? 'string';
+      const req = required.has(name) ? ' (required)' : '';
+      const pdesc = (spec?.description ?? '').split('\n')[0].slice(0, 80);
+      return `    ARG ${name}: ${type}${req}${pdesc ? ' — ' + pdesc : ''}`;
+    });
+    return `- ${f.name}: ${desc}\n${argLines.join('\n')}`;
   }).join('\n');
 }
 
-// Build the flattened prompt, rendering tool_calls / tool results and the protocol.
+function exampleToolCall(tools) {
+  // Build a concrete example from a tool the model is likely to use.
+  const byName = {};
+  for (const t of tools) { const f = t.function ?? t; byName[f.name] = f; }
+  if (byName.bash) {
+    return '```tool_call\nTOOL: bash\nARG command: ls -la\nARG description: List files in the current directory\n```';
+  }
+  const first = (tools[0]?.function ?? tools[0]);
+  const firstArg = Object.keys(first?.parameters?.properties ?? {})[0] ?? 'arg';
+  return `\`\`\`tool_call\nTOOL: ${first?.name ?? 'tool_name'}\nARG ${firstArg}: value\n\`\`\``;
+}
+
 function buildToolPrompt(messages, tools) {
   const sys = [];
   const convo = [];
@@ -304,56 +325,58 @@ function buildToolPrompt(messages, tools) {
           const name = tc.function?.name ?? tc.name ?? 'tool';
           const args = tc.function?.arguments ?? tc.arguments ?? '{}';
           if (tc.id) idToName[tc.id] = name;
-          convo.push(`Assistant called tool: ${name}(${typeof args === 'string' ? args : JSON.stringify(args)})`);
+          convo.push(`[Assistant called: ${name}]`);
         }
       }
       const c = contentToString(m.content).trim();
-      if (c) convo.push(`Assistant: ${c}`);
+      if (c) convo.push(`[Assistant]\n${c}`);
     } else if (m.role === 'tool') {
       const name = idToName[m.tool_call_id] ?? 'tool';
-      convo.push(`Tool result from ${name}:\n${contentToString(m.content).trim()}`);
+      convo.push(`[Result of ${name}]\n${contentToString(m.content).trim()}`);
     } else {
       const t = contentToString(m.content).trim();
-      if (t) convo.push(`User: ${t}`);
+      if (t) convo.push(`[User]\n${t}`);
     }
   }
 
   let p = '';
   if (sys.length) p += sys.join('\n\n') + '\n\n';
-  if (tools?.length) {
-    p += '# Tool-calling protocol\n\n';
-    p += 'You can call tools to complete the task. Available tools:\n\n';
+
+  if (toolNames.size) {
+    p += '═══════════════════════════════════════════════════\n';
+    p += 'TOOL USE — MANDATORY PROTOCOL (read carefully)\n';
+    p += '═══════════════════════════════════════════════════\n';
+    p += 'You have NO terminal and NO file access of your own. You CANNOT run\n';
+    p += 'commands. Writing a command such as `ls`, `$tree`, or `cat file` as\n';
+    p += 'plain text does NOTHING — it is never executed. The ONLY way to take\n';
+    p += 'any real action is to output a tool_call block.\n\n';
+    p += 'When you need to act, output ONE OR MORE blocks in EXACTLY this format,\n';
+    p += 'with no prose before or inside the block:\n\n';
+    p += '```tool_call\nTOOL: <tool name from the list>\nARG <argname>: <value>\nARG <argname>: <value>\n```\n\n';
+    p += 'Available tools and their arguments:\n';
     p += renderToolsForPrompt(tools) + '\n\n';
-    p += 'To call a tool, reply with ONLY a fenced block, nothing before or after it:\n\n';
-    p += '```tool_call\n';
-    p += 'TOOL: <tool_name>\n';
-    p += 'ARG <arg_name>: <value>\n';
-    p += 'ARG <arg_name>: <value>\n';
-    p += '```\n\n';
+    p += 'Example — to list files in the current directory, output exactly:\n';
+    p += exampleToolCall(tools) + '\n\n';
     p += 'Rules:\n';
-    p += '- Each `ARG` line gives one argument. A value may span multiple lines; it continues until the next `ARG` line or the end of the block.\n';
-    p += '- Write values LITERALLY. Do NOT escape quotes, backslashes, or newlines. Shell commands are written exactly as you would type them.\n';
-    p += '- For numbers, booleans, arrays, or objects, write them as JSON on the value line (e.g. `ARG limit: 100` or `ARG paths: ["a","b"]`).\n\n';
-    p += 'Example — read a file:\n';
-    p += '```tool_call\nTOOL: read\nARG path: src/index.ts\n```\n\n';
-    p += 'Example — run a shell command (note the quotes are written as-is, NOT escaped):\n';
-    p += '```tool_call\nTOOL: bash\nARG command: find . -type f | awk \'{printf "%s\\n", $0}\'\nARG description: list files\n```\n\n';
-    p += 'After each call you receive a "Tool result" message — continue calling tools as needed.\n';
-    p += 'When the task is complete, reply normally with your final answer and NO tool_call block.\n\n';
+    p += '1. Use the EXACT argument names shown above (e.g. filePath, not path).\n';
+    p += '2. To inspect the project, run shell commands via the bash tool.\n';
+    p += '3. Emit tool_call blocks directly — do not describe what you "would" run.\n';
+    p += '4. After tool results come back, either call more tools or give your\n';
+    p += '   final answer in plain text.\n';
+    p += '═══════════════════════════════════════════════════\n\n';
   }
-  if (convo.length > 1) p += '--- Conversation so far ---\n\n';
+
+  if (convo.length > 1) p += '---\n\n';
   p += convo.join('\n\n');
-  if (tools?.length) {
-    p += '\n\n--- CRITICAL REMINDER (re-read before responding) ---\n\n';
-    p += `You have ${tools.length} tool(s) available: ${[...toolNames].join(', ')}.\n`;
-    p += 'If you need a file or shell output, you MUST call a tool using the fenced tool_call block above.\n';
-    p += 'Do NOT assume tools are unavailable. Do NOT reply with "Tool X does not exist" or "I don\'t have access to tools" or similar — those statements are wrong and forbidden.\n';
-    p += 'If you cannot proceed without calling a tool, emit a tool_call block. Do not ask the user for file contents.';
+
+  if (toolNames.size) {
+    p += `\n\n[Reminder] To act, output a \`\`\`tool_call block now. Do NOT type commands as text — they will not run. Available tools: ${[...toolNames].join(', ')}.`;
   }
   return p;
 }
 
-// Coerce a raw value string into JSON when it looks structured, else keep as string.
+// ─── Tool call parsing ──────────────────────────────────────────────────────────
+
 function coerceArgValue(raw) {
   const t = raw.trim();
   if (t === '') return '';
@@ -362,13 +385,13 @@ function coerceArgValue(raw) {
   if (t === 'false') return false;
   if (t === 'null') return null;
   if (t.startsWith('{') || t.startsWith('[')) {
-    try { return JSON.parse(t); } catch { /* keep raw */ }
+    try { return JSON.parse(t); } catch {}
   }
   return raw.replace(/\s+$/, '');
 }
 
-// Try to parse a block as JSON tool call(s). Returns calls array or null.
 function tryJsonToolCalls(text, toolNames) {
+  if (!text || typeof text !== 'string') return null;
   const t = text.trim();
   if (!(t.startsWith('{') || t.startsWith('['))) return null;
   let parsed;
@@ -387,12 +410,10 @@ function tryJsonToolCalls(text, toolNames) {
 const TOOL_LINE_RE = /^\s*(?:TOOL|tool|name)\s*[:=]\s*(.+?)\s*$/;
 const ARG_LINE_RE = /^\s*ARG\s+([A-Za-z0-9_.-]+)\s*[:=]\s*(.*)$/;
 
-// Parse one block using the escaping-free ARG format, tolerating loose model output:
-// the tool name may be `TOOL: name`, `name:`, or just a bare line equal to a known tool.
 function parseArgBlock(blockText, toolNames) {
+  if (typeof blockText !== 'string') return null;
   const lines = blockText.replace(/\r/g, '').split('\n');
 
-  // Locate the tool-name line.
   let name = null;
   let startIdx = -1;
   for (let i = 0; i < lines.length; i++) {
@@ -424,8 +445,6 @@ function parseArgBlock(blockText, toolNames) {
   return [{ name, arguments: args }];
 }
 
-// Extract tool call(s) from the model's output. Collects from EVERY fenced block (the
-// model often emits several calls at once); falls back to the raw text if no fence.
 function extractToolCalls(text, toolNames) {
   if (!text) return null;
 
@@ -445,56 +464,102 @@ function extractToolCalls(text, toolNames) {
     if (calls.length) return calls;
   }
 
-  // No fenced calls — try the whole text once (model may omit the fence entirely).
   const json = tryJsonToolCalls(text, toolNames);
   if (json) return json;
   const arg = parseArgBlock(text, toolNames);
   if (arg) return arg;
 
-  // Last-resort heuristic: if the model mentions tools by name in prose like
-  // "Tool read does not exists." (it's hallucinating that tools are unavailable),
-  // extract the tool names so we can at least log them. We DO NOT synthesize calls
-  // from this pattern — no args to extract — but the diagnostic log will flag it.
-  const mentioned = new Set();
-  for (const line of text.split('\n')) {
-    const m2 = line.match(/\bTool\s+(?:read|bash|glob|grep|write|edit|task|webfetch|todowrite|question|skill|google_search|mystatus)\b/i);
-    if (m2) mentioned.add(m2[1]?.toLowerCase?.() ?? m2[0].split(/\s+/)[1].toLowerCase());
-  }
-  if (mentioned.size) {
-    dbg({ phase: 'hallucinated_tool_mentions', mentioned: [...mentioned], sample: text.slice(0, 400) });
-  }
   return null;
 }
 
-export { extractToolCalls };
+// Not exported — included for use within the plugin only.
 
-// Read the entire Qwen SSE stream, returning the concatenated 'answer' phase text.
-async function collectAnswerText(firstValue, reader) {
-  const decoder = new TextDecoder();
-  let buffer = firstValue ? decoder.decode(firstValue, { stream: true }) : '';
-  let answer = '';
-  const drain = () => {
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const raw = line.slice(6).trim();
-      if (!raw || raw.startsWith('{"response.created"')) continue;
-      try {
-        const d = JSON.parse(raw).choices?.[0]?.delta;
-        if (d?.phase === 'answer' && d.content) answer += d.content;
-      } catch {}
-    }
-  };
-  drain();
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    drain();
-  }
-  return answer;
+// ─── SSE transform (streaming pass-through) ─────────────────────────────────────
+// Translates Qwen's phase-based SSE to OpenAI chunk format in real time.
+
+function makeChunk(id, created, model, delta, finishReason) {
+  return `data: ${JSON.stringify({
+    id, object: 'chat.completion.chunk', created, model,
+    choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
+  })}\n\n`;
 }
+
+function transformQwenSSE(body, model) {
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const id = `chatcmpl-${randomUUID()}`;
+  const created = Math.floor(Date.now() / 1000);
+  let buffer = '';
+  let sentRole = false;
+  let sentDone = false;
+
+  return body.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      buffer += decoder.decode(chunk, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const raw = line.slice(6).trim();
+        if (!raw || raw.startsWith('{"response.created"')) continue;
+        let parsed;
+        try { parsed = JSON.parse(raw); } catch { continue; }
+        const delta = parsed.choices?.[0]?.delta;
+        if (!delta) continue;
+        const { phase, status, content } = delta;
+        if (phase !== 'answer') continue;
+
+        if (!sentRole) {
+          controller.enqueue(encoder.encode(makeChunk(id, created, model, { role: 'assistant', content: '' }, null)));
+          sentRole = true;
+        }
+        if (status === 'finished') {
+          controller.enqueue(encoder.encode(makeChunk(id, created, model, {}, 'stop')));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          sentDone = true;
+        } else if (content) {
+          controller.enqueue(encoder.encode(makeChunk(id, created, model, { content }, null)));
+        }
+      }
+    },
+    flush(controller) {
+      if (!sentDone) {
+        if (!sentRole) {
+          controller.enqueue(encoder.encode(makeChunk(id, created, model, { role: 'assistant', content: '' }, null)));
+        }
+        controller.enqueue(encoder.encode(makeChunk(id, created, model, {}, 'stop')));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+      }
+    },
+  }));
+}
+
+function restitchStream(firstValue, reader) {
+  return new ReadableStream({
+    start(c) { if (firstValue) c.enqueue(firstValue); },
+    async pull(c) {
+      const { value, done } = await reader.read();
+      if (done) { c.close(); return; }
+      c.enqueue(value);
+    },
+    cancel(reason) { reader.cancel(reason).catch(() => {}); },
+  });
+}
+
+// ─── Tool mode: stream answer text + detect tool calls at end ───────────────────
+// For tool mode we still need the full text to parse tool calls. But we
+// ALSO forward content chunks in real time so the user sees progress.
+// If tool calls are detected at the end, we re-emit them as synthetic chunks.
+
+function makeToolOrContentResponse(answer, toolNames, model) {
+  const calls = extractToolCalls(answer, toolNames);
+  if (calls) {
+    return toolCallResponseChunks(calls, model);
+  }
+  return contentResponseChunks(answer, model);
+}
+
+// ─── Synthetic chunk builders ───────────────────────────────────────────────────
 
 function sseStreamFrom(chunks) {
   const enc = new TextEncoder();
@@ -504,6 +569,10 @@ function sseStreamFrom(chunks) {
 }
 
 function contentResponseChunks(text, model) {
+  if (!text) {
+    // Qwen sent empty content — still emit valid SSE so OpenCode doesn't hang
+    text = '[empty response]';
+  }
   const id = `chatcmpl-${randomUUID()}`;
   const created = Math.floor(Date.now() / 1000);
   return [
@@ -551,79 +620,25 @@ function toQwenMessage(msg, model) {
   };
 }
 
-// ─── SSE transformation ────────────────────────────────────────────────────────
-
-function makeChunk(id, created, model, delta, finishReason) {
-  return `data: ${JSON.stringify({
-    id, object: 'chat.completion.chunk', created, model,
-    choices: [{ index: 0, delta, finish_reason: finishReason ?? null }],
-  })}\n\n`;
-}
-
-function transformQwenSSE(body, model) {
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const id = `chatcmpl-${randomUUID()}`;
-  const created = Math.floor(Date.now() / 1000);
-  let buffer = '';
-  let sentRole = false;
-  let sentDone = false;
-
-  return body.pipeThrough(new TransformStream({
-    transform(chunk, controller) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        const raw = line.slice(6).trim();
-        if (!raw || raw.startsWith('{"response.created"')) continue;
-        let parsed;
-        try { parsed = JSON.parse(raw); } catch { continue; }
-        const delta = parsed.choices?.[0]?.delta;
-        if (!delta) continue;
-        const { phase, status, content } = delta;
-        if (phase !== 'answer') continue;
-        if (!sentRole) {
-          controller.enqueue(encoder.encode(makeChunk(id, created, model, { role: 'assistant', content: '' }, null)));
-          sentRole = true;
-        }
-        if (status === 'finished') {
-          controller.enqueue(encoder.encode(makeChunk(id, created, model, {}, 'stop')));
-          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-          sentDone = true;
-        } else if (content) {
-          controller.enqueue(encoder.encode(makeChunk(id, created, model, { content }, null)));
-        }
-      }
-    },
-    flush(controller) {
-      if (!sentDone) {
-        if (!sentRole) {
-          controller.enqueue(encoder.encode(makeChunk(id, created, model, { role: 'assistant', content: '' }, null)));
-        }
-        controller.enqueue(encoder.encode(makeChunk(id, created, model, {}, 'stop')));
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-      }
-    },
-  }));
-}
-
-function restitchStream(firstValue, reader) {
-  return new ReadableStream({
-    start(c) { if (firstValue) c.enqueue(firstValue); },
-    async pull(c) {
-      const { value, done } = await reader.read();
-      if (done) { c.close(); return; }
-      c.enqueue(value);
-    },
-    cancel(reason) { reader.cancel(reason); },
-  });
-}
-
 // ─── Main fetch interceptor with account rotation ───────────────────────────────
 
 async function qwenFetch(storedToken, input, init) {
+  const url = typeof input === 'string' ? input : input?.url ?? '';
+  dbg({ phase: 'qwenFetch', url, hasInit: !!init, method: init?.method ?? 'GET' });
+  if (url.endsWith('/models') || url.endsWith('/models/')) {
+    dbg({ phase: 'models_list' });
+    return new Response(JSON.stringify({
+      object: 'list',
+      data: Object.entries(MODELS).map(([id, cfg]) => ({
+        id, object: 'model', created: 0,
+        owned_by: 'qwen',
+        name: cfg.name,
+        context_length: cfg.context,
+        max_output: cfg.output,
+      })),
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+
   const accounts = collectAccounts(storedToken);
   if (accounts.length === 0) {
     notify('No valid Qwen accounts found. Log into chat.qwen.ai in Firefox.', 'error');
@@ -637,7 +652,7 @@ async function qwenFetch(storedToken, input, init) {
   if (init?.body) bodyStr = typeof init.body === 'string' ? init.body : await new Response(init.body).text();
   else if (input instanceof Request) bodyStr = await input.clone().text();
   let body = {};
-  try { body = bodyStr ? JSON.parse(bodyStr) : {}; } catch { /* ignore */ }
+  try { body = bodyStr ? JSON.parse(bodyStr) : {}; } catch {} // graceful
 
   const model = body.model ?? 'qwen3.6-plus';
   const messages = body.messages ?? [];
@@ -645,15 +660,14 @@ async function qwenFetch(storedToken, input, init) {
   const wantTools = tools && body.tool_choice !== 'none';
   const toolNames = new Set((tools ?? []).map(t => t.function?.name ?? t.name).filter(Boolean));
 
+  const promptText = wantTools ? buildToolPrompt(messages, tools) : buildPrompt(messages);
+
   dbg({
     phase: 'request', model,
     hasToolsField: Array.isArray(body.tools), nTools: (body.tools ?? []).length,
     toolNames: [...toolNames], tool_choice: body.tool_choice ?? null,
     nMessages: messages.length, lastRole: messages[messages.length - 1]?.role ?? null,
-    // Full prompt (helps diagnose history poisoning)
-    promptSent: promptText,
   });
-  const promptText = wantTools ? buildToolPrompt(messages, tools) : flattenConversation(messages);
   const userMessage = toQwenMessage({ role: 'user', content: promptText }, model);
 
   const now = Date.now();
@@ -664,7 +678,7 @@ async function qwenFetch(storedToken, input, init) {
     const mins = Number.isFinite(soonestReset) ? Math.ceil((soonestReset - now) / 60000) : null;
     notify(`All ${accounts.length} account(s) rate-limited${mins != null ? `; reset in ~${mins} min` : ''}.`, 'error');
     return new Response(
-      JSON.stringify({ error: { message: `All ${accounts.length} Qwen account(s) are rate-limited${mins != null ? `; next reset in ~${mins} min` : ''}. Add another account to ~/.config/opencode/qwen-accounts.json or log into another account in a separate Firefox profile.`, type: 'rate_limit_error' } }),
+      JSON.stringify({ error: { message: `All ${accounts.length} Qwen account(s) are rate-limited${mins != null ? `; next reset in ~${mins} min` : ''}.`, type: 'rate_limit_error' } }),
       { status: 429, headers: { 'content-type': 'application/json' } }
     );
   }
@@ -674,13 +688,17 @@ async function qwenFetch(storedToken, input, init) {
     const { id, token, label } = account;
     const isFailover = lastServedAccountId !== null && lastServedAccountId !== id && lastErr !== null;
 
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(new Error('Request timeout')), REQUEST_TIMEOUT_MS);
     let chatId;
     try {
-      chatId = await createChatSession(token, model);
+      chatId = await createChatSession(token, model, abort.signal);
     } catch (err) {
+      clearTimeout(timer);
       const kind = classifyFailure(err.status ?? 0, err.body ?? err.message);
       if (kind === 'quota' || kind === 'rate_limit') {
         markRateLimited(state, id, kind, now); saveState(state);
+        invalidateCache();
         notify(`${label} hit its limit — switching account…`, 'warning');
         lastErr = err; continue;
       }
@@ -691,20 +709,26 @@ async function qwenFetch(storedToken, input, init) {
     try {
       response = await fetch(`${QWEN_BASE}/api/v2/chat/completions?chat_id=${chatId}`, {
         method: 'POST',
-        headers: buildHeaders(token, { 'accept': 'application/json', 'x-accel-buffering': 'no' }),
+        signal: abort.signal,
+        headers: buildHeaders(token),
         body: JSON.stringify({
           stream: true, version: '2.1', incremental_output: true, chat_id: chatId,
           chat_mode: 'normal', model, parent_id: null,
           messages: [userMessage], timestamp: Math.floor(Date.now() / 1000),
         }),
       });
-    } catch (err) { lastErr = err; continue; }
+    } catch (err) {
+      clearTimeout(timer);
+      lastErr = err; continue;
+    }
+    clearTimeout(timer);
 
     if (!response.ok) {
       const text = await response.text();
       const kind = classifyFailure(response.status, text);
       if (kind === 'quota' || kind === 'rate_limit') {
         markRateLimited(state, id, kind, now); saveState(state);
+        invalidateCache();
         notify(`${label} hit its limit — switching account…`, 'warning');
         lastErr = new Error(`Qwen ${response.status}`); continue;
       }
@@ -719,6 +743,7 @@ async function qwenFetch(storedToken, input, init) {
     const firstText = first.value ? new TextDecoder().decode(first.value) : '';
     if (firstChunkLooksExhausted(firstText)) {
       markRateLimited(state, id, 'quota', now); saveState(state);
+      invalidateCache();
       notify(`${label} hit its limit — switching account…`, 'warning');
       lastErr = new Error('quota error in stream');
       try { await reader.cancel(); } catch {}
@@ -735,11 +760,10 @@ async function qwenFetch(storedToken, input, init) {
     const baseHeaders = {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache',
-      'x-accel-buffering': 'no',
       'x-qwen-account': id,
     };
 
-    // Tool mode: buffer the full answer, parse for a tool_call, emit OpenAI tool_calls or content.
+    // Tool mode: stream answer text as it arrives, then at the end check for tool calls
     if (wantTools) {
       const answer = await collectAnswerText(first.value, reader);
       const calls = extractToolCalls(answer, toolNames);
@@ -767,11 +791,56 @@ async function qwenFetch(storedToken, input, init) {
   );
 }
 
+// ─── Collected answer reader (buffers for tool parsing) ──────────────────────────
+
+async function collectAnswerText(firstValue, reader) {
+  const decoder = new TextDecoder();
+  let buffer = firstValue ? decoder.decode(firstValue, { stream: true }) : '';
+  let answer = '';
+  let finished = false;
+  const drain = () => {
+    const lines = buffer.split('\n');
+    buffer = lines.pop() ?? '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      if (!raw || raw.startsWith('{"response.created"')) continue;
+      try {
+        const d = JSON.parse(raw).choices?.[0]?.delta;
+        if (d?.phase === 'answer') {
+          answer += d.content ?? '';
+          if (d.status === 'finished') finished = true;
+        }
+      } catch {}
+    }
+  };
+  drain();
+  // Stop as soon as Qwen signals the answer is finished. Waiting for the
+  // socket to fully close (the old behavior) caused multi-minute hangs
+  // because Qwen frequently holds the connection open after the final token.
+  while (!finished) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    drain();
+  }
+  // Release the connection so the request doesn't dangle until timeout.
+  try { await reader.cancel(); } catch {}
+  return answer;
+}
+
+function firstChunkLooksExhausted(text) {
+  if (!text) return false;
+  if (text.includes('"response.created"') || text.includes('"choices"')) return false;
+  const b = text.toLowerCase();
+  return b.includes('error') && (b.includes('quota') || b.includes('limit') ||
+         b.includes('rate') || b.includes('exceed') || b.includes('forbidden'));
+}
+
 // ─── Plugin ───────────────────────────────────────────────────────────────────
 
 export default async function (input) {
   toastClient = input?.client ?? null;
-
   return {
     auth: {
       provider: PROVIDER_ID,
@@ -780,6 +849,7 @@ export default async function (input) {
         const auth = await getAuth();
         const storedToken = (auth?.type === 'api' && auth?.key) ? auth.key : null;
         const accounts = collectAccounts(storedToken);
+        dbg({ phase: 'loader', accountsFound: accounts.length, authType: auth?.type });
         if (accounts.length === 0) return null;
         return {
           apiKey: accounts[0].token,
